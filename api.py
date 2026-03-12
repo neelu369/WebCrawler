@@ -25,7 +25,12 @@ load_dotenv()
 
 from crawler.graph import graph  # noqa: E402
 from crawler.cost_tracker import tracker  # noqa: E402
-from crawler.agents import AgentToAgentPipeline  # noqa: E402
+from crawler.agents import (  # noqa: E402
+    AgentToAgentPipeline,
+    merge_metrics,
+    suggest_metrics_for_query,
+)
+from crawler.agents.a2a_store import save_a2a_run  # noqa: E402
 
 # ── App ──────────────────────────────────────────────────────
 app = FastAPI(
@@ -107,13 +112,21 @@ class A2ACrawlRequest(BaseModel):
         examples=["Top startup incubators in India"],
     )
     required_metrics: list[str] = Field(
-        ...,
-        description="Metrics that must be present in final extracted data.",
+        default_factory=list,
+        description="Explicit metrics required by caller.",
         examples=[["Funding Amount", "Location", "Equity Taken"]],
-        min_length=1,
+    )
+    user_metrics: list[str] = Field(
+        default_factory=list,
+        description="Additional user-provided metrics to enforce.",
+        examples=[["IMDb Score", "Release Year"]],
+    )
+    auto_suggest_metrics: bool = Field(
+        default=True,
+        description="If true, include domain-based metric suggestions from query.",
     )
     max_rounds: int = Field(
-        default=3,
+        default=2,
         ge=1,
         le=10,
         description="Maximum crawl-validation rounds before no data available.",
@@ -125,13 +138,23 @@ class A2ACrawlResponse(BaseModel):
     message: str
     session_id: str
     query: str
+    suggested_metrics: list[str]
+    user_metrics: list[str]
+    final_metrics: list[str]
     required_metrics: list[str]
     available_metrics: list[str]
     missing_metrics: list[str]
+    missing_data_details: list[dict[str, Any]]
+    run_id: str | None = None
     entities: list[dict[str, Any]]
     communication_log: list[dict[str, Any]]
     rounds_used: int
     cost_summary: dict[str, Any]
+
+
+class A2AMetricSuggestionResponse(BaseModel):
+    query: str
+    suggested_metrics: list[str]
 
 
 # ── Background pipeline runner ───────────────────────────────
@@ -227,9 +250,41 @@ async def cost_summary():
 @app.post("/crawl/a2a", response_model=A2ACrawlResponse)
 async def crawl_agent_to_agent(request: A2ACrawlRequest):
     """Run strict agent-to-agent crawl/validation orchestration."""
+    suggested_metrics = (
+        suggest_metrics_for_query(request.query) if request.auto_suggest_metrics else []
+    )
+    user_metrics = [*request.required_metrics, *request.user_metrics]
+    final_metrics = merge_metrics(
+        suggested_metrics=suggested_metrics,
+        user_metrics=user_metrics,
+    )
+    if not final_metrics:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "No metrics selected. Provide required_metrics/user_metrics or enable "
+                "auto_suggest_metrics."
+            ),
+        )
+
     pipeline = AgentToAgentPipeline(max_rounds=request.max_rounds)
     result = await pipeline.run(
         query=request.query,
-        required_metrics=request.required_metrics,
+        required_metrics=final_metrics,
     )
-    return A2ACrawlResponse(**result.to_dict())
+    payload = result.to_dict()
+    payload["suggested_metrics"] = suggested_metrics
+    payload["user_metrics"] = user_metrics
+    payload["final_metrics"] = final_metrics
+    run_id = await save_a2a_run(payload=payload, source="api")
+    payload["run_id"] = run_id
+    return A2ACrawlResponse(**payload)
+
+
+@app.get("/crawl/a2a/suggest-metrics", response_model=A2AMetricSuggestionResponse)
+async def suggest_a2a_metrics(query: str):
+    """Suggest domain-specific metrics for a query."""
+    return A2AMetricSuggestionResponse(
+        query=query,
+        suggested_metrics=suggest_metrics_for_query(query),
+    )

@@ -14,12 +14,48 @@ from __future__ import annotations
 
 import asyncio
 import time
+from typing import Any
 
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
 load_dotenv()
+
+
+def _normalize_name(value: str) -> str:
+    return " ".join(value.strip().lower().split())
+
+
+def _merge_csv_values(existing: str, incoming: str) -> str:
+    values: list[str] = []
+    seen: set[str] = set()
+    for blob in [existing, incoming]:
+        for part in str(blob).split("|"):
+            value = part.strip()
+            if not value:
+                continue
+            norm = value.lower()
+            if norm in seen:
+                continue
+            seen.add(norm)
+            values.append(value)
+    return " | ".join(values)
+
+
+def _merge_url_values(existing: str, incoming: str) -> str:
+    urls: list[str] = []
+    seen: set[str] = set()
+    for blob in [existing, incoming]:
+        for part in str(blob).split(","):
+            value = part.strip()
+            if not value:
+                continue
+            if value in seen:
+                continue
+            seen.add(value)
+            urls.append(value)
+    return ", ".join(urls)
 
 
 # ── Helper: Fetch History ────────────────────────────────────
@@ -53,6 +89,7 @@ def fetch_history():
             entity_count = await db.extracted_entities.count_documents(
                 {"session_id": sess_id}
             )
+            a2a_runs = await db.a2a_runs.count_documents({"session_id": sess_id})
 
             history_data.append(
                 {
@@ -60,6 +97,7 @@ def fetch_history():
                     "Date": date_str,
                     "Query": query,
                     "Entities Found": entity_count,
+                    "A2A Runs": a2a_runs,
                 }
             )
 
@@ -84,22 +122,74 @@ def fetch_session_docs(session_id: str):
         )
         entities = await cursor.to_list(length=100)
 
-        table_data = []
+        table_data_map: dict[str, dict[str, Any]] = {}
         for ent in entities:
-            row = {
-                "Priority": round(ent.get("priority_score", 0.0), 2),
-                "Entity Name": ent.get("name", "Unknown"),
-                "Source URL": ent.get("source_url", ""),
-                "Description": ent.get("description", ""),
-            }
+            entity_name = str(ent.get("name", "Unknown")).strip() or "Unknown"
+            key = _normalize_name(entity_name)
+
+            row = table_data_map.get(key)
+            if row is None:
+                row = {
+                    "Priority": round(float(ent.get("priority_score", 0.0)), 2),
+                    "Entity Name": entity_name,
+                    "Source URL": ent.get("source_url", ""),
+                    "Description": ent.get("description", ""),
+                }
+                table_data_map[key] = row
+            else:
+                row["Priority"] = max(
+                    float(row.get("Priority", 0.0)),
+                    float(ent.get("priority_score", 0.0)),
+                )
+                existing_desc = str(row.get("Description", ""))
+                incoming_desc = str(ent.get("description", ""))
+                if len(incoming_desc) > len(existing_desc):
+                    row["Description"] = incoming_desc
+                row["Source URL"] = _merge_url_values(
+                    str(row.get("Source URL", "")),
+                    str(ent.get("source_url", "")),
+                )
+
             # Flatten metrics into the row
             metrics = ent.get("metrics", {})
             if isinstance(metrics, dict):
                 for k, v in metrics.items():
-                    # Prefix to group them nicely, or just direct name
-                    row[k] = str(v)
-            table_data.append(row)
+                    key_name = str(k)
+                    if key_name in row:
+                        row[key_name] = _merge_csv_values(str(row[key_name]), str(v))
+                    else:
+                        row[key_name] = str(v)
+        table_data = list(table_data_map.values())
+        table_data.sort(key=lambda item: float(item.get("Priority", 0.0)), reverse=True)
         return table_data
+
+    return run_async(_fetch())
+
+
+def fetch_a2a_runs(session_id: str):
+    """Fetch prior A2A runs for a specific crawler session."""
+    import os
+    from motor.motor_asyncio import AsyncIOMotorClient
+
+    uri = os.getenv("MONGO_URI", "mongodb://localhost:27017")
+    db_name = os.getenv("MONGO_DB_NAME", "langgraph_crawler")
+    client = AsyncIOMotorClient(uri)
+    db = client[db_name]
+
+    async def _fetch():
+        cursor = db.a2a_runs.find({"session_id": session_id}).sort("created_at", -1).limit(20)
+        runs = await cursor.to_list(length=20)
+        formatted: list[dict[str, Any]] = []
+        for run in runs:
+            run_copy = dict(run)
+            run_copy["_id"] = str(run_copy.get("_id", ""))
+            created_at = run_copy.get("created_at")
+            if hasattr(created_at, "strftime"):
+                run_copy["created_at"] = created_at.strftime("%Y-%m-%d %H:%M:%S")
+            elif created_at is not None:
+                run_copy["created_at"] = str(created_at)
+            formatted.append(run_copy)
+        return formatted
 
     return run_async(_fetch())
 
@@ -151,6 +241,36 @@ def run_async(coro):
         loop.close()
 
 
+def parse_metric_csv(raw: str) -> list[str]:
+    """Parse comma-separated metrics from text input."""
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def entities_to_table_rows(entities: list[Any]) -> list[dict[str, Any]]:
+    """Flatten extracted entities into tabular rows."""
+    rows: list[dict[str, Any]] = []
+    for entity in entities:
+        if hasattr(entity, "model_dump"):
+            payload = entity.model_dump()
+        elif isinstance(entity, dict):
+            payload = dict(entity)
+        else:
+            continue
+
+        row = {
+            "Priority": round(float(payload.get("priority_score", 0.0)), 2),
+            "Entity Name": payload.get("name", "Unknown"),
+            "Source URL": payload.get("source_url", ""),
+            "Description": payload.get("description", ""),
+        }
+        metrics = payload.get("metrics", {})
+        if isinstance(metrics, dict):
+            for key, value in metrics.items():
+                row[str(key)] = str(value)
+        rows.append(row)
+    return rows
+
+
 # ── Sidebar: Configuration ───────────────────────────────────
 with st.sidebar:
     st.markdown("### ⚙️ Pipeline Configuration")
@@ -195,7 +315,7 @@ st.markdown(
 )
 
 # ── Layout: Tabs ─────────────────────────────────────────────
-tab1, tab2 = st.tabs(["🔍 New Search", "🕰️ History"])
+tab1, tab_a2a, tab2 = st.tabs(["🔍 New Search", "🤝 A2A Search", "🕰️ History"])
 
 with tab1:
     # ── Query input ──────────────────────────────────────────────
@@ -340,6 +460,197 @@ with tab1:
         st.warning("Please enter a research query first.")
 
 
+with tab_a2a:
+    st.markdown("### 🤝 Agent-to-Agent Strict Pipeline")
+    st.caption(
+        "Flow: Crawler Agent stores to MongoDB + ChromaDB → Validator Agent checks "
+        "required metrics → one targeted recrawl if needed → else `no data available`."
+    )
+
+    a2a_query = st.text_area(
+        "🔎 A2A Research Query",
+        placeholder="e.g., Top Hollywood movies in 2025",
+        height=80,
+        key="a2a_query",
+    )
+
+    selected_suggested_metrics: list[str] = []
+    custom_metrics = parse_metric_csv(
+        st.text_input(
+            "✍️ Additional User Metrics (comma-separated)",
+            placeholder="e.g., IMDb Score, Runtime",
+            key="a2a_custom_metrics",
+        )
+    )
+
+    if a2a_query.strip():
+        from crawler.agents.metric_suggester import merge_metrics, suggest_metrics_for_query
+
+        suggested_metrics = suggest_metrics_for_query(a2a_query)
+        selected_suggested_metrics = st.multiselect(
+            "🤖 Suggested Metrics (select what you want to enforce)",
+            options=suggested_metrics,
+            default=suggested_metrics,
+            key="a2a_suggested_metrics",
+        )
+        final_metrics = merge_metrics(
+            suggested_metrics=selected_suggested_metrics,
+            user_metrics=custom_metrics,
+        )
+    else:
+        suggested_metrics = []
+        final_metrics = custom_metrics
+        st.info("Enter a query to get automatic metric suggestions.")
+
+    st.markdown("**Final Metrics Enforced By Validator**")
+    if final_metrics:
+        st.code(", ".join(final_metrics))
+    else:
+        st.warning("No metrics selected yet.")
+
+    a2a_rounds = st.slider(
+        "A2A Rounds (strict mode uses one recrawl; recommended: 2)",
+        min_value=1,
+        max_value=4,
+        value=2,
+        key="a2a_rounds",
+    )
+
+    run_a2a = st.button(
+        "🚀 Run A2A Pipeline",
+        type="primary",
+        use_container_width=True,
+        key="run_a2a_btn",
+    )
+
+    if run_a2a and not a2a_query.strip():
+        st.warning("Please enter a research query first.")
+    elif run_a2a and not final_metrics:
+        st.warning("Please select/add at least one metric.")
+    elif run_a2a:
+        from crawler.agents import AgentToAgentPipeline
+        from crawler.cost_tracker import tracker
+        from crawler.nodes import mongo_logger as _ml, preprocessor as _pp
+
+        # Reset stateful clients for this fresh async run in Streamlit.
+        _ml._client = None
+        _pp._client = None
+        tracker._calls.clear()
+
+        t0 = time.time()
+        try:
+            with st.spinner("🤝 Running A2A pipeline... (this may take 1-3 minutes)"):
+                pipeline = AgentToAgentPipeline(max_rounds=a2a_rounds)
+                result_obj = run_async(
+                    pipeline.run(
+                        query=a2a_query.strip(),
+                        required_metrics=final_metrics,
+                    )
+                )
+            elapsed = time.time() - t0
+            result = result_obj.to_dict()
+            result["suggested_metrics"] = suggested_metrics
+            result["user_metrics"] = custom_metrics
+            result["final_metrics"] = final_metrics
+
+            from crawler.agents.a2a_store import save_a2a_run
+
+            try:
+                run_id = run_async(save_a2a_run(payload=result, source="dashboard"))
+            except Exception as store_exc:
+                run_id = ""
+                st.warning(f"Could not persist A2A run log: {store_exc}")
+            result["run_id"] = run_id
+
+            st.markdown("---")
+            st.markdown("### 📊 A2A Summary")
+            m1, m2, m3, m4 = st.columns(4)
+            with m1:
+                st.metric("Status", result.get("status", "unknown"))
+            with m2:
+                st.metric("Rounds Used", result.get("rounds_used", 0))
+            with m3:
+                st.metric("Entities", len(result.get("entities", [])))
+            with m4:
+                st.metric("Duration", f"{elapsed:.1f}s")
+            st.caption(f"A2A Run ID: {result.get('run_id', '')}")
+
+            st.markdown("### 🎯 Metric Validation")
+            st.write("Required:", result.get("required_metrics", []))
+            st.write("Available:", result.get("available_metrics", []))
+            st.write("Missing:", result.get("missing_metrics", []))
+
+            missing_data_details = result.get("missing_data_details", [])
+            if missing_data_details:
+                st.markdown("### ⚠️ Entities With Missing/Placeholder Metrics")
+                issue_rows: list[dict[str, Any]] = []
+                for detail in missing_data_details:
+                    entity_name = detail.get("entity_name", "Unknown Entity")
+                    for metric in detail.get("missing_metrics", []):
+                        issue_rows.append(
+                            {
+                                "Entity Name": entity_name,
+                                "Metric": metric,
+                                "Issue Type": "Missing",
+                                "Value": "",
+                            }
+                        )
+                    for metric, value in detail.get("placeholder_metrics", {}).items():
+                        issue_rows.append(
+                            {
+                                "Entity Name": entity_name,
+                                "Metric": metric,
+                                "Issue Type": "Placeholder",
+                                "Value": str(value),
+                            }
+                        )
+                if issue_rows:
+                    st.dataframe(pd.DataFrame(issue_rows), width="stretch", hide_index=True)
+
+            st.markdown("### 💬 Agent Communication Log")
+            comm_log = result.get("communication_log", [])
+            if comm_log:
+                df_log = pd.DataFrame(comm_log)
+                df_log = df_log.rename(
+                    columns={
+                        "round_number": "Round",
+                        "from_agent": "From",
+                        "to_agent": "To",
+                        "content": "Message",
+                    }
+                )
+                st.dataframe(df_log, width="stretch", hide_index=True)
+            else:
+                st.info("No communication logs found.")
+
+            entities = result.get("entities", [])
+            if entities:
+                st.markdown("### 📦 A2A Extracted Entities")
+                table_data = entities_to_table_rows(entities)
+                df = pd.DataFrame(table_data)
+                col_config = {
+                    "Priority": st.column_config.NumberColumn("Priority", format="%.2f"),
+                    "Source URL": st.column_config.LinkColumn("Source URL"),
+                    "Description": st.column_config.TextColumn(
+                        "Description", width="large"
+                    ),
+                }
+                st.dataframe(
+                    df,
+                    width="stretch",
+                    column_config=col_config,
+                    hide_index=True,
+                )
+            else:
+                st.warning(result.get("message", "no data available"))
+
+        except Exception as exc:
+            st.error(f"A2A pipeline error: {exc}")
+            import traceback
+
+            st.code(traceback.format_exc())
+
+
 with tab2:
     st.markdown("### 🕰️ Past Research Sessions")
 
@@ -360,17 +671,26 @@ with tab2:
         )
 
         st.markdown("### 📂 View Session Results")
-        selected_session = st.selectbox(
-            "Select a session to view its extracted entities:",
-            options=[h["Session ID"] for h in history if h["Entities Found"] > 0],
-            format_func=lambda x: f"{next(h['Date'] for h in history if h['Session ID'] == x)} — {next(h['Query'] for h in history if h['Session ID'] == x)[:50]}...",
-        )
+        session_options = [
+            h["Session ID"]
+            for h in history
+            if h["Entities Found"] > 0 or h.get("A2A Runs", 0) > 0
+        ]
+        if not session_options:
+            st.info("No sessions with extracted entities or A2A runs yet.")
+            selected_session = None
+        else:
+            selected_session = st.selectbox(
+                "Select a session to view its extracted entities:",
+                options=session_options,
+                format_func=lambda x: f"{next(h['Date'] for h in history if h['Session ID'] == x)} — {next(h['Query'] for h in history if h['Session ID'] == x)[:50]}...",
+            )
 
         if selected_session:
             entities_data = fetch_session_docs(selected_session)
-            if entities_data:
-                st.markdown(f"**Results for Session:** `{selected_session}`")
+            st.markdown(f"**Results for Session:** `{selected_session}`")
 
+            if entities_data:
                 col_config = {
                     "Priority": st.column_config.NumberColumn(
                         "Priority", format="%.2f"
@@ -397,12 +717,81 @@ with tab2:
                     mime="text/csv",
                     key="download_hist",
                 )
+            else:
+                st.info("No extracted entities found for this session.")
+
+            a2a_runs = fetch_a2a_runs(selected_session)
+            st.markdown("### 🤝 Past A2A Runs")
+            if not a2a_runs:
+                st.info("No A2A runs stored for this session.")
+            else:
+                run_labels = [
+                    f"{run.get('created_at', 'Unknown')} | {run.get('status', 'unknown')} | rounds={run.get('rounds_used', 0)}"
+                    for run in a2a_runs
+                ]
+                selected_idx = st.selectbox(
+                    "Select an A2A run to inspect:",
+                    options=list(range(len(a2a_runs))),
+                    format_func=lambda i: run_labels[i],
+                    key="history_a2a_run_select",
+                )
+                selected_run = a2a_runs[selected_idx]
+
+                st.write("Final Metrics:", selected_run.get("final_metrics", []))
+                st.write("Available Metrics:", selected_run.get("available_metrics", []))
+                st.write("Missing Metrics:", selected_run.get("missing_metrics", []))
+
+                missing_details = selected_run.get("missing_data_details", [])
+                if missing_details:
+                    st.markdown("**Missing / Placeholder Metric Details**")
+                    detail_rows: list[dict[str, Any]] = []
+                    for detail in missing_details:
+                        entity_name = detail.get("entity_name", "Unknown Entity")
+                        for metric in detail.get("missing_metrics", []):
+                            detail_rows.append(
+                                {
+                                    "Entity Name": entity_name,
+                                    "Metric": metric,
+                                    "Issue Type": "Missing",
+                                    "Value": "",
+                                }
+                            )
+                        for metric, value in detail.get("placeholder_metrics", {}).items():
+                            detail_rows.append(
+                                {
+                                    "Entity Name": entity_name,
+                                    "Metric": metric,
+                                    "Issue Type": "Placeholder",
+                                    "Value": str(value),
+                                }
+                            )
+                    if detail_rows:
+                        st.dataframe(
+                            pd.DataFrame(detail_rows),
+                            width="stretch",
+                            hide_index=True,
+                        )
+
+                comm_log = selected_run.get("communication_log", [])
+                st.markdown("**Communication Log**")
+                if comm_log:
+                    df_log = pd.DataFrame(comm_log).rename(
+                        columns={
+                            "round_number": "Round",
+                            "from_agent": "From",
+                            "to_agent": "To",
+                            "content": "Message",
+                        }
+                    )
+                    st.dataframe(df_log, width="stretch", hide_index=True)
+                else:
+                    st.info("No communication logs found for this run.")
 
 # ── Footer ───────────────────────────────────────────────────
 st.markdown("---")
 st.markdown(
     '<p style="text-align: center; color: #4a5568; font-size: 0.85rem;">'
-    "LangGraph Crawler Pipeline v0.1.0 • Replicate + Tavily + MongoDB"
+    "LangGraph Crawler Pipeline v0.1.0 • Replicate + Tavily + MongoDB + ChromaDB + A2A"
     "</p>",
     unsafe_allow_html=True,
 )

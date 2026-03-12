@@ -26,6 +26,21 @@ from crawler.state import State
 
 _client: AsyncIOMotorClient | None = None
 _chroma_kb_cache: dict[tuple[str, str, int], Any] = {}
+_PLACEHOLDER_VALUES = {
+    "",
+    "n/a",
+    "na",
+    "none",
+    "null",
+    "nil",
+    "unknown",
+    "not available",
+    "not specified",
+    "unspecified",
+    "tbd",
+    "-",
+    "--",
+}
 
 
 def _get_client() -> AsyncIOMotorClient:
@@ -76,6 +91,70 @@ def _clean_text(text: str) -> str:
     text = re.sub(r"&[a-zA-Z]+;", " ", text)  # HTML entities
     text = re.sub(r"\s+", " ", text).strip()  # collapse whitespace
     return text
+
+
+def _normalize_name(value: str) -> str:
+    return " ".join(value.strip().lower().split())
+
+
+def _is_placeholder(value: Any) -> bool:
+    return " ".join(str(value).strip().lower().split()) in _PLACEHOLDER_VALUES
+
+
+def _merge_source_urls(existing: str, new_value: str) -> str:
+    urls: list[str] = []
+    seen: set[str] = set()
+    for chunk in [existing, new_value]:
+        for part in str(chunk).split(","):
+            url = part.strip()
+            if not url:
+                continue
+            if url in seen:
+                continue
+            seen.add(url)
+            urls.append(url)
+    return ", ".join(urls)
+
+
+def _merge_metric_values(existing: Any, new_value: Any) -> str:
+    entries: list[str] = []
+    seen_norm: set[str] = set()
+
+    for raw in [existing, new_value]:
+        text = str(raw).strip()
+        if not text:
+            continue
+        parts = [p.strip() for p in text.split("|")]
+        for part in parts:
+            if not part:
+                continue
+            norm = part.lower()
+            if norm in seen_norm:
+                continue
+            seen_norm.add(norm)
+            entries.append(part)
+
+    non_placeholder = [item for item in entries if not _is_placeholder(item)]
+    if non_placeholder:
+        return " | ".join(non_placeholder)
+    return " | ".join(entries)
+
+
+def _merge_metrics(
+    existing: dict[str, Any],
+    incoming: dict[str, Any],
+) -> dict[str, str]:
+    merged: dict[str, str] = {}
+    for key, value in existing.items():
+        merged[str(key)] = str(value)
+
+    for key, value in incoming.items():
+        key_str = str(key)
+        if key_str in merged:
+            merged[key_str] = _merge_metric_values(merged[key_str], value)
+        else:
+            merged[key_str] = str(value)
+    return merged
 
 
 _EXTRACT_PROMPT = """\
@@ -211,20 +290,64 @@ async def preprocess(
         db = client[configuration.mongo_db_name]
         proc_col = db["extracted_entities"]
         now = datetime.now(timezone.utc)
-
-        operations = []
         for entity in extracted:
-            operations.append(
+            payload = entity.model_dump()
+            norm_name = _normalize_name(entity.name)
+            existing = await proc_col.find_one(
                 {
-                    "name": entity.name,
-                    **entity.model_dump(),
                     "session_id": state.session_id,
-                    "updated_at": now,
-                    "created_at": now,
+                    "normalized_name": norm_name,
                 }
             )
-        if operations:
-            await proc_col.insert_many(operations)
+
+            if existing:
+                merged_metrics = _merge_metrics(
+                    existing.get("metrics", {}) if isinstance(existing.get("metrics"), dict) else {},
+                    payload.get("metrics", {}) if isinstance(payload.get("metrics"), dict) else {},
+                )
+                merged_source_url = _merge_source_urls(
+                    str(existing.get("source_url", "")),
+                    str(payload.get("source_url", "")),
+                )
+                existing_desc = str(existing.get("description", ""))
+                incoming_desc = str(payload.get("description", ""))
+                merged_desc = incoming_desc if len(incoming_desc) > len(existing_desc) else existing_desc
+                existing_content = str(existing.get("original_content", ""))
+                incoming_content = str(payload.get("original_content", ""))
+                merged_content = (
+                    incoming_content
+                    if len(incoming_content) > len(existing_content)
+                    else existing_content
+                )
+                merged_priority = max(
+                    float(existing.get("priority_score", 0.0)),
+                    float(payload.get("priority_score", 0.0)),
+                )
+
+                await proc_col.update_one(
+                    {"_id": existing["_id"]},
+                    {
+                        "$set": {
+                            "description": merged_desc,
+                            "metrics": merged_metrics,
+                            "source_url": merged_source_url,
+                            "priority_score": merged_priority,
+                            "original_content": merged_content,
+                            "updated_at": now,
+                        }
+                    },
+                )
+            else:
+                await proc_col.insert_one(
+                    {
+                        "name": entity.name,
+                        "normalized_name": norm_name,
+                        **payload,
+                        "session_id": state.session_id,
+                        "updated_at": now,
+                        "created_at": now,
+                    }
+                )
 
     async def _write_chroma_entities() -> list[str]:
         kb = _get_chroma_kb(configuration)

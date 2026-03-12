@@ -3,7 +3,8 @@
 Example:
   python a2a_main.py \
     --query "Top startup incubators in India" \
-    --metrics "Funding Amount,Location,Equity Taken"
+    --metrics "Funding Amount,Location,Equity Taken" \
+    --user-metrics "Success Rate"
 """
 
 from __future__ import annotations
@@ -26,7 +27,37 @@ def _parse_metrics(raw_metrics: str) -> list[str]:
 
 
 async def _run_pipeline(args: argparse.Namespace) -> None:
-    from crawler.agents import AgentToAgentPipeline
+    from crawler.agents import (
+        AgentToAgentPipeline,
+        merge_metrics,
+        suggest_metrics_for_query,
+    )
+
+    explicit_metrics = _parse_metrics(args.metrics) if args.metrics else []
+    user_metrics = _parse_metrics(args.user_metrics) if args.user_metrics else []
+    suggested_metrics = (
+        suggest_metrics_for_query(args.query) if not args.disable_auto_suggest else []
+    )
+    final_metrics = merge_metrics(
+        suggested_metrics=suggested_metrics,
+        user_metrics=[*explicit_metrics, *user_metrics],
+    )
+
+    if not final_metrics:
+        print(
+            json.dumps(
+                {
+                    "status": "no_data_available",
+                    "message": "no data available",
+                    "query": args.query,
+                    "suggested_metrics": suggested_metrics,
+                    "final_metrics": [],
+                },
+                indent=2,
+                ensure_ascii=True,
+            )
+        )
+        return
 
     pipeline = AgentToAgentPipeline(
         max_rounds=args.max_rounds,
@@ -37,9 +68,12 @@ async def _run_pipeline(args: argparse.Namespace) -> None:
     )
     result = await pipeline.run(
         query=args.query,
-        required_metrics=_parse_metrics(args.metrics),
+        required_metrics=final_metrics,
     )
-    print(json.dumps(result.to_dict(), indent=2, ensure_ascii=True))
+    payload = result.to_dict()
+    payload["suggested_metrics"] = suggested_metrics
+    payload["final_metrics"] = final_metrics
+    print(json.dumps(payload, indent=2, ensure_ascii=True))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -51,13 +85,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--metrics",
-        required=True,
-        help="Comma-separated required metrics, e.g. 'Funding Amount,Location'.",
+        default="",
+        help="Comma-separated strict metrics, e.g. 'Funding Amount,Location'.",
+    )
+    parser.add_argument(
+        "--user-metrics",
+        default="",
+        help="Additional comma-separated user metrics to merge with suggestions.",
+    )
+    parser.add_argument(
+        "--disable-auto-suggest",
+        action="store_true",
+        help="Disable query-based metric suggestions.",
     )
     parser.add_argument(
         "--max-rounds",
         type=int,
-        default=3,
+        default=2,
         help="Maximum crawl-validation rounds before returning no data available.",
     )
     parser.add_argument(
