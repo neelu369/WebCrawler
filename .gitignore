@@ -91,3 +91,5 @@ Thumbs.db
 *.temp
 *.swp
 *.swo
+chroma_db/
+*.sqlite3
