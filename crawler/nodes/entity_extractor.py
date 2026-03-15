@@ -17,13 +17,13 @@ def _get_client():
     if _client is None:
         uri = os.getenv("MONGO_URI", "mongodb://localhost:27017")
         if not uri.startswith(("mongodb://", "mongodb+srv://")):
-            raise ValueError(
-                f"[EntityExtractor] MONGO_URI is invalid: {uri!r}\n"
-                "Must start with 'mongodb://' or 'mongodb+srv://'.\n"
-                "Check your .env — MONGO_URI and NEO4J_URI may be swapped.\n"
-                "Example: MONGO_URI=mongodb://localhost:27017"
-            )
-        _client = AsyncIOMotorClient(uri)
+            if uri.startswith(("bolt://", "neo4j://", "bolt+s://", "neo4j+s://")):
+                raise ValueError(
+                    f"[EntityExtractor] MONGO_URI looks like a Neo4j URI: {uri!r}\n"
+                    "Fix .env: MONGO_URI=mongodb://localhost:27017"
+                )
+            raise ValueError(f"[EntityExtractor] MONGO_URI invalid: {uri!r}")
+        _client = AsyncIOMotorClient(uri, serverSelectionTimeoutMS=5000)
     return _client
 
 def _clean_text(text: str) -> str:

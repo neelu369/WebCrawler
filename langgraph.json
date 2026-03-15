@@ -1,8 +1,0 @@
-{
-  "$schema": "https://langgra.ph/schema.json",
-  "dependencies": ["."],
-  "graphs": {
-    "crawler": "./crawler/graph.py:graph"
-  },
-  "env": ".env"
-}

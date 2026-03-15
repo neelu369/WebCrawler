@@ -75,12 +75,32 @@ def route_after_evaluation(state: State) -> Literal["__end__", "intent_parser"]:
 # separately for the Neo4j knowledge graph path.
 
 async def log_and_preprocess(state: State, config=None):
-    """Run mongo_logger then preprocessor sequentially."""
-    log_result = await log_to_mongo(state, config)
-    # Update state inline so preprocessor sees the session_id
-    from dataclasses import replace
-    updated = replace(state, **{k: v for k, v in log_result.items() if hasattr(state, k)})
-    pre_result = await preprocess(updated, config)
+    """Run mongo_logger then preprocessor sequentially.
+    Both are optional — if MongoDB is misconfigured or unreachable,
+    log a warning and continue with a generated session_id.
+    """
+    import uuid as _uuid
+
+    # Step 1: mongo_logger (handles its own errors internally)
+    try:
+        log_result = await log_to_mongo(state, config)
+    except Exception as exc:
+        print(f"[Graph] mongo_logger failed: {exc}. Continuing with generated session_id.")
+        log_result = {
+            "raw_doc_ids":    [src.url for src in state.verified_sources],
+            "raw_vector_ids": [],
+            "session_id":     _uuid.uuid4().hex[:24],
+        }
+
+    # Step 2: preprocessor — update state with session_id, then run
+    try:
+        from dataclasses import replace as dc_replace
+        updated    = dc_replace(state, **{k: v for k, v in log_result.items() if hasattr(state, k)})
+        pre_result = await preprocess(updated, config)
+    except Exception as exc:
+        print(f"[Graph] preprocessor failed: {exc}. ChromaDB skipped — pipeline continues.")
+        pre_result = {}
+
     return {**log_result, **pre_result}
 
 

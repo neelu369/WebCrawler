@@ -1,11 +1,12 @@
-"""FastAPI server for the LangGraph Crawler Pipeline.
+"""FastAPI server for the WebCrawler Ranking Pipeline.
 
 Endpoints:
-  POST /crawl/rank        — Full ranking pipeline (SSE streaming progress)
-  GET  /crawl/rank/{id}   — Poll for ranking result
-  POST /crawl/a2a         — Agent-to-agent pipeline
-  GET  /health            — Health check
-  GET  /cost-summary      — Latest cost report
+  POST /crawl/rank             — Start pipeline (returns job_id)
+  GET  /crawl/rank/{id}/stream — SSE stream of live events
+  GET  /crawl/rank/{id}        — Poll for final result
+  POST /crawl/a2a              — Agent-to-agent validation pipeline
+  GET  /health
+  GET  /cost-summary
 
 Run:
     uvicorn api:app --reload --port 8000
@@ -15,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import uuid
 from datetime import datetime, timezone
 from typing import Any, AsyncGenerator
@@ -27,16 +29,38 @@ from pydantic import BaseModel, Field
 
 load_dotenv()
 
-from crawler.graph import graph  # noqa: E402
-from crawler.cost_tracker import tracker  # noqa: E402
-from crawler.agents import AgentToAgentPipeline  # noqa: E402
-from crawler.agents.structure_rank_pipeline import StructureRankPipeline  # noqa: E402
+# ── Startup env validation ────────────────────────────────────
+def _validate_env() -> None:
+    """Fail fast with a clear message if required env vars are wrong."""
+    errors = []
 
-app = FastAPI(
-    title="WebCrawler Ranking Pipeline",
-    description="Multi-agent research pipeline with Neo4j knowledge graph and LLM ranking.",
-    version="2.0.0",
-)
+    mongo_uri = os.getenv("MONGO_URI", "mongodb://localhost:27017")
+    if not mongo_uri.startswith(("mongodb://", "mongodb+srv://")):
+        errors.append(
+            f"  MONGO_URI={mongo_uri!r} — must start with 'mongodb://' or 'mongodb+srv://'\n"
+            "  (Did you accidentally paste the Neo4j bolt URI here?)"
+        )
+
+    neo4j_uri = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+    if not neo4j_uri.startswith(("bolt://", "bolt+s://", "neo4j://", "neo4j+s://")):
+        errors.append(
+            f"  NEO4J_URI={neo4j_uri!r} — must start with 'bolt://' or 'neo4j://'\n"
+            "  (Did you accidentally paste the MongoDB URI here?)"
+        )
+
+    if errors:
+        msg = "❌ Environment variable errors — fix your .env file:\n\n" + "\n\n".join(errors)
+        raise RuntimeError(msg)
+
+    print("✅ Env validated — MONGO_URI and NEO4J_URI look correct.")
+
+_validate_env()
+
+from crawler.graph import graph                   # noqa: E402
+from crawler.cost_tracker import tracker          # noqa: E402
+from crawler.agents import Orchestrator            # noqa: E402
+
+app = FastAPI(title="WebCrawler Ranking Pipeline", version="2.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -45,17 +69,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── In-memory job store ──────────────────────────────────────
 _jobs: dict[str, dict[str, Any]] = {}
 
 
-# ── SSE helper ───────────────────────────────────────────────
 def _sse(event: str, data: Any) -> str:
-    payload = json.dumps(data, ensure_ascii=False, default=str)
-    return f"event: {event}\ndata: {payload}\n\n"
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
 
 
-# ── Request / Response models ────────────────────────────────
 class RankRequest(BaseModel):
     query: str = Field(..., description="The ranking question to research.")
     max_retries: int = Field(default=2, ge=0, le=5)
@@ -82,13 +102,12 @@ class A2ACrawlResponse(BaseModel):
     cost_summary: dict[str, Any]
 
 
-# ── Core pipeline runner with progress events ────────────────
-async def _run_rank_pipeline(
-    job_id: str,
-    query: str,
-    config: dict,
-) -> None:
-    """Run the full ranking pipeline and push SSE progress to job store."""
+async def _run_rank_pipeline(job_id: str, query: str, config: dict) -> None:
+    """
+    Full pipeline:
+      Phase 1 — LangGraph: crawl → extract → Neo4j → StructuredResults
+      Phase 2 — RankingEngine: StructuredResults → weighted composite → RankingResult
+    """
     job = _jobs[job_id]
     events: list[dict] = job["events"]
 
@@ -97,180 +116,132 @@ async def _run_rank_pipeline(
         events.append(entry)
 
     try:
-        # ── Phase 1: LangGraph pipeline (crawl → extract → Neo4j) ──
+        # ── Phase 1: LangGraph ────────────────────────────────
         push("phase_start", {"phase": "crawl", "label": "Starting web crawl pipeline"})
 
-        push("node_start", {"node": "intent_parser", "label": "Parsing intent & generating search queries"})
-        push("node_start", {"node": "url_discovery", "label": "Discovering URLs via Tavily search"})
-        push("node_start", {"node": "web_crawler", "label": "Crawling pages (crawl4ai + httpx)"})
-        push("node_start", {"node": "source_verifier", "label": "Verifying source credibility"})
-        push("node_start", {"node": "mongo_logger", "label": "Persisting verified sources"})
+        for node, label in [
+            ("intent_parser",    "Parsing intent & generating search queries"),
+            ("url_discovery",    "Discovering URLs via Tavily search"),
+            ("web_crawler",      "Crawling pages (crawl4ai + httpx)"),
+            ("source_verifier",  "Verifying source credibility"),
+            ("mongo_logger",     "Persisting to MongoDB + ChromaDB"),
+            ("entity_extractor", "Extracting knowledge graph triples"),
+            ("neo4j_ingester",   "Ingesting entities into Neo4j"),
+            ("graph_structurer", "Querying Neo4j → StructuredResults"),
+            ("metrics_evaluator","Checking for missing metric gaps"),
+        ]:
+            push("node_start", {"node": node, "label": label})
 
         result = await graph.ainvoke(
             {"user_query": query},
             config={"configurable": config},
         )
 
-        session_id = result.get("session_id", "")
+        session_id         = result.get("session_id", "")
         structured_results = result.get("structured_results", [])
         extracted_entities = result.get("extracted_entities", [])
+        missing_targets    = result.get("missing_data_targets", [])
 
-        push("node_complete", {"node": "entity_extractor", "label": "Entities extracted as triples", "count": len(extracted_entities)})
-        push("node_complete", {"node": "neo4j_ingester", "label": "Knowledge graph populated in Neo4j"})
-        push("node_complete", {"node": "graph_structurer", "label": "Structured results built from graph", "count": len(structured_results)})
-        push("node_complete", {"node": "metrics_evaluator", "label": "Metrics evaluated for completeness"})
+        push("node_complete", {"node": "entity_extractor",  "label": f"{len(extracted_entities)} entities with triples extracted", "count": len(extracted_entities)})
+        push("node_complete", {"node": "neo4j_ingester",    "label": "Knowledge graph written to Neo4j"})
+        push("node_complete", {"node": "graph_structurer",  "label": f"{len(structured_results)} structured results from Neo4j",   "count": len(structured_results)})
+        push("node_complete", {"node": "metrics_evaluator", "label": f"{len(missing_targets)} missing metric gaps detected"})
 
-        missing = result.get("missing_data_targets", [])
-        if missing:
+        if missing_targets:
             push("agent_message", {
                 "from": "metrics_evaluator",
                 "to": "intent_parser",
-                "content": f"Missing data for {len(missing)} targets. Triggering retry loop.",
-                "missing": missing,
+                "content": f"Triggered retry loop — {len(missing_targets)} missing metric targets",
+                "missing": missing_targets,
             })
 
-        push("phase_complete", {"phase": "crawl", "label": "Crawl pipeline complete", "entities": len(extracted_entities)})
+        push("phase_complete", {"phase": "crawl", "label": f"Crawl complete — {len(structured_results)} entities ready for ranking", "entities": len(structured_results)})
 
-        # ── Phase 2: Agent loop (StructuringAgent + RankingAgent) ──
-        push("phase_start", {"phase": "agents", "label": "Starting agent ranking loop"})
+        # ── Phase 2: Ranking Engine ───────────────────────────
+        push("phase_start", {"phase": "ranking", "label": "Starting ranking engine"})
 
-        if not session_id:
-            push("warning", {"message": "No session ID — skipping structure/rank phase"})
-            job["status"] = "completed"
-            job["ranked_table"] = {}
-            job["cost_summary"] = result.get("cost_summary", {})
+        if not structured_results:
+            push("warning", {"message": "No structured results — cannot produce ranking. Try a more specific query."})
+            job.update({"status": "completed", "ranking_result": {}, "cost_summary": result.get("cost_summary", {}), "completed_at": datetime.now(timezone.utc).isoformat()})
+            push("done", {"status": "completed", "job_id": job_id})
             return
 
+        # Build feature matrix summary for the log
+        all_props: set[str] = set()
+        for sr in structured_results:
+            all_props.update(sr.properties.keys())
+            for rel in sr.relationships:
+                if rel.get("type"):
+                    all_props.add(rel["type"])
+
         push("agent_message", {
             "from": "orchestrator",
-            "to": "structuring_agent",
-            "content": f"Structure entities from ChromaDB for session {session_id}",
+            "to": "ranking_engine",
+            "content": f"Ranking {len(structured_results)} entities — {len(all_props)} feature columns available",
+        })
+        push("agent_message", {
+            "from": "ranking_engine",
+            "to": "ranking_engine",
+            "content": f"Feature matrix built: {len(structured_results)} × {len(all_props)}",
+            "columns": sorted(all_props),
+        })
+        push("agent_message", {
+            "from": "ranking_engine",
+            "to": "ranking_engine",
+            "content": "Calling LLM to select and weight ranking criteria...",
         })
 
-        pipeline = StructureRankPipeline(
-            session_id=session_id,
+        engine = Orchestrator()
+        ranking_result = engine.rank(
             user_query=query,
+            session_id=session_id,
+            structured_results=structured_results,
         )
 
-        table = pipeline.run_structure()
+        top_name = ranking_result.entities[0].name if ranking_result.entities else "none"
         push("agent_message", {
-            "from": "structuring_agent",
-            "to": "validator",
-            "content": f"Structured {len(table.rows)} entities across {len(table.columns)} columns",
-            "columns": table.columns,
-            "missing_cells": table.missing_report.total_missing_cells if table.missing_report else 0,
-        })
-
-        # Gap-fill loop
-        max_patch_rounds = 2
-        for patch_round in range(max_patch_rounds):
-            if not table.missing_report or table.missing_report.is_complete():
-                push("agent_message", {
-                    "from": "validator",
-                    "to": "orchestrator",
-                    "content": "All metrics satisfied. Proceeding to ranking.",
-                })
-                break
-
-            missing_cols = table.missing_report.missing_columns
-            push("agent_message", {
-                "from": "validator",
-                "to": "crawler_agent",
-                "content": f"Round {patch_round + 1}: Missing {len(missing_cols)} columns — requesting targeted recrawl",
-                "missing_columns": missing_cols,
-            })
-
-            # Targeted recrawl via A2A crawler agent
-            a2a = AgentToAgentPipeline(max_rounds=1)
-            recrawl = await a2a.crawler_agent.crawl(
-                base_query=query,
-                missing_metrics=missing_cols,
-                session_id=session_id,
-            )
-
-            push("agent_message", {
-                "from": "crawler_agent",
-                "to": "structuring_agent",
-                "content": f"Recrawl complete: {len(recrawl.entities)} new entities found",
-            })
-
-            table = pipeline.apply_patch(recrawl.entities)
-
-            push("agent_message", {
-                "from": "structuring_agent",
-                "to": "validator",
-                "content": f"After patch: {table.missing_report.total_missing_cells if table.missing_report else 0} missing cells remain",
-            })
-
-        push("agent_message", {
-            "from": "orchestrator",
-            "to": "ranking_agent",
-            "content": f"Ranking {len(table.rows)} entities using LLM-determined criteria",
-        })
-
-        final = pipeline.run_ranking()
-
-        push("agent_message", {
-            "from": "ranking_agent",
+            "from": "ranking_engine",
             "to": "orchestrator",
-            "content": f"Ranking complete. Top entity: {final.ranked_table.rows[0].entity_name if final.ranked_table.rows else 'none'}",
-            "criteria": [c.to_dict() for c in final.ranked_table.criteria],
+            "content": f"Ranking complete — #{1}: {top_name} (score={ranking_result.entities[0].composite_score:.4f})" if ranking_result.entities else "Ranking complete — no entities scored",
+            "criteria":  [c.to_dict() for c in ranking_result.criteria],
+            "rationale": ranking_result.ranking_rationale,
         })
 
-        push("phase_complete", {"phase": "agents", "label": "Agent loop complete"})
+        push("phase_complete", {"phase": "ranking", "label": f"Ranked {ranking_result.total_entities} entities", "top_entity": top_name})
 
-        # ── Phase 3: Final result ──
-        push("phase_start", {"phase": "result", "label": "Building final ranking table"})
-
-        ranked_dict = final.ranked_table.to_dict()
-        push("phase_complete", {"phase": "result", "label": "Ranking table ready", "row_count": len(ranked_dict.get("rows", []))})
-
-        job["status"] = "completed"
-        job["session_id"] = session_id
-        job["ranked_table"] = ranked_dict
-        job["structured_table"] = final.structured_table.to_dict()
-        job["cost_summary"] = result.get("cost_summary", tracker.get_summary())
-        job["completed_at"] = datetime.now(timezone.utc).isoformat()
-
+        job.update({
+            "status":         "completed",
+            "session_id":     session_id,
+            "ranking_result": ranking_result.to_dict(),
+            "cost_summary":   result.get("cost_summary", tracker.get_summary()),
+            "completed_at":   datetime.now(timezone.utc).isoformat(),
+        })
         push("done", {"status": "completed", "job_id": job_id})
 
     except Exception as exc:
+        import traceback
+        print(f"[Pipeline] ERROR job={job_id}:\n{traceback.format_exc()}")
         push("error", {"message": str(exc)})
-        job["status"] = "failed"
-        job["error"] = str(exc)
-        job["completed_at"] = datetime.now(timezone.utc).isoformat()
+        job.update({"status": "failed", "error": str(exc), "completed_at": datetime.now(timezone.utc).isoformat()})
 
 
-# ── Endpoints ────────────────────────────────────────────────
+# ── Endpoints ─────────────────────────────────────────────────
 
 @app.post("/crawl/rank")
 async def start_rank(request: RankRequest):
-    """Start ranking pipeline. Returns job_id immediately."""
     job_id = str(uuid.uuid4())[:8]
     _jobs[job_id] = {
-        "job_id": job_id,
-        "status": "running",
-        "query": request.query,
+        "job_id": job_id, "status": "running", "query": request.query,
         "started_at": datetime.now(timezone.utc).isoformat(),
-        "completed_at": None,
-        "events": [],
-        "ranked_table": None,
-        "structured_table": None,
-        "cost_summary": {},
-        "session_id": "",
-        "error": None,
+        "completed_at": None, "events": [], "ranking_result": None,
+        "cost_summary": {}, "session_id": "", "error": None,
     }
-    config = {
-        "max_retries": request.max_retries,
-        "min_credibility": request.min_credibility,
-    }
-    asyncio.create_task(_run_rank_pipeline(job_id, request.query, config))
+    asyncio.create_task(_run_rank_pipeline(job_id, request.query, {"max_retries": request.max_retries, "min_credibility": request.min_credibility}))
     return {"job_id": job_id, "status": "running"}
 
 
 @app.get("/crawl/rank/{job_id}/stream")
 async def stream_rank_events(job_id: str):
-    """SSE stream of pipeline progress events."""
     if job_id not in _jobs:
         raise HTTPException(status_code=404, detail="Job not found")
 
@@ -280,23 +251,19 @@ async def stream_rank_events(job_id: str):
         while True:
             events = job["events"]
             while sent_idx < len(events):
-                yield _sse(events[sent_idx]["type"], events[sent_idx])
+                ev = events[sent_idx]
+                yield _sse(ev["type"], ev)
                 sent_idx += 1
             if job["status"] in ("completed", "failed"):
                 yield _sse("status", {"status": job["status"], "job_id": job_id})
                 break
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.25)
 
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
+    return StreamingResponse(event_generator(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 @app.get("/crawl/rank/{job_id}")
 async def get_rank_result(job_id: str):
-    """Poll for ranking result."""
     if job_id not in _jobs:
         raise HTTPException(status_code=404, detail="Job not found")
     return _jobs[job_id]
@@ -304,21 +271,14 @@ async def get_rank_result(job_id: str):
 
 @app.post("/crawl/a2a", response_model=A2ACrawlResponse)
 async def crawl_agent_to_agent(request: A2ACrawlRequest):
-    """Run strict agent-to-agent crawl/validation orchestration."""
-    pipeline = AgentToAgentPipeline(max_rounds=request.max_rounds)
-    result = await pipeline.run(
-        query=request.query,
-        required_metrics=request.required_metrics,
-    )
+    pipeline = Orchestrator(max_a2a_rounds=request.max_rounds)
+    result = await pipeline.a2a_run(query=request.query, required_metrics=request.required_metrics)
     return A2ACrawlResponse(**result.to_dict())
 
 
 @app.get("/health")
 async def health():
-    return {
-        "status": "ok",
-        "active_jobs": sum(1 for j in _jobs.values() if j["status"] == "running"),
-    }
+    return {"status": "ok", "active_jobs": sum(1 for j in _jobs.values() if j["status"] == "running")}
 
 
 @app.get("/cost-summary")

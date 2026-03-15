@@ -32,7 +32,14 @@ def _get_client() -> AsyncIOMotorClient:
     global _client
     if _client is None:
         uri = os.getenv("MONGO_URI", "mongodb://localhost:27017")
-        _client = AsyncIOMotorClient(uri)
+        if not uri.startswith(("mongodb://", "mongodb+srv://")):
+            if uri.startswith(("bolt://", "neo4j://", "bolt+s://", "neo4j+s://")):
+                raise ValueError(
+                    f"[Preprocessor] MONGO_URI looks like a Neo4j URI: {uri!r}\n"
+                    "Fix .env: MONGO_URI=mongodb://localhost:27017"
+                )
+            raise ValueError(f"[Preprocessor] MONGO_URI invalid: {uri!r} — must start with mongodb://")
+        _client = AsyncIOMotorClient(uri, serverSelectionTimeoutMS=5000)
     return _client
 
 
@@ -207,24 +214,16 @@ async def preprocess(
     async def _write_mongo_entities() -> None:
         if not extracted:
             return
-        client = _get_client()
-        db = client[configuration.mongo_db_name]
-        proc_col = db["extracted_entities"]
-        now = datetime.now(timezone.utc)
-
-        operations = []
-        for entity in extracted:
-            operations.append(
-                {
-                    "name": entity.name,
-                    **entity.model_dump(),
-                    "session_id": state.session_id,
-                    "updated_at": now,
-                    "created_at": now,
-                }
-            )
-        if operations:
-            await proc_col.insert_many(operations)
+        try:
+            client = _get_client()
+            db = client[configuration.mongo_db_name]
+            proc_col = db["extracted_entities"]
+            now = datetime.now(timezone.utc)
+            operations = [{"name": entity.name, **entity.model_dump(), "session_id": state.session_id, "updated_at": now, "created_at": now} for entity in extracted]
+            if operations:
+                await proc_col.insert_many(operations)
+        except Exception as exc:
+            print(f"[Preprocessor] MongoDB write skipped: {exc}")
 
     async def _write_chroma_entities() -> list[str]:
         kb = _get_chroma_kb(configuration)
@@ -247,8 +246,7 @@ async def preprocess(
             else:
                 await _write_mongo_entities()
         except Exception as exc:
-            print(f"[Preprocessor] Storage write failed: {exc}")
-            raise
+            print(f"[Preprocessor] Storage write failed: {exc}. Continuing.")
 
     # ── Attach cost summary to state ─────────────────────
     cost_summary = tracker.get_summary()

@@ -17,6 +17,7 @@ function normaliseRanking(raw) {
         entity_type: e.entity_type || "",
         description: e.description || "",
         composite_score: e.composite_score ?? 0,
+        algorithm_scores: e.algorithm_scores || {},
         criterion_scores: e.criterion_scores || {},
         fields: e.properties || {},
         relationships: e.relationships || [],
@@ -583,6 +584,9 @@ export default function App() {
 
             <div style={{ display: "flex", alignItems: "baseline", gap: "1rem", marginBottom: "1rem", paddingBottom: "1rem", borderBottom: "1px solid var(--border)" }}>
               <h2 className="ranking-title">Ranking Results</h2>
+              <span style={{ fontSize: "0.6rem", color: "var(--rank)", border: "1px solid var(--rank)", padding: "0.15rem 0.5rem", letterSpacing: "0.08em" }}>
+                TOPSIS 55% + BORDA 35% + COMPLETENESS 10%
+              </span>
               <span className="ranking-meta">
                 {rankedTable.rows.length} entities
                 {rankedTable.session_id ? ` · session #${rankedTable.session_id.slice(0, 8)}` : ""}
@@ -646,7 +650,7 @@ export default function App() {
                           )}
                         </td>
 
-                        {/* Composite score + criterion bars */}
+                        {/* Composite score + algorithm breakdown + criterion bars */}
                         <td className="score-cell">
                           <div className="score-bar">
                             <div className="score-track">
@@ -654,6 +658,28 @@ export default function App() {
                             </div>
                             <span className="score-val">{row.composite_score.toFixed(3)}</span>
                           </div>
+                          {/* Algorithm breakdown: TOPSIS / Borda / Completeness */}
+                          {row.algorithm_scores && Object.keys(row.algorithm_scores).length > 0 && (
+                            <div className="crit-bars" style={{ marginTop: "0.4rem" }}>
+                              {[
+                                { key: "topsis",       label: "TOPSIS",   color: "#00e5ff", pct: 55 },
+                                { key: "borda",        label: "Borda",    color: "#7c3aed", pct: 35 },
+                                { key: "completeness", label: "Complete", color: "#10b981", pct: 10 },
+                              ].map(({ key, label, color, pct }) => {
+                                const val = row.algorithm_scores[key] ?? 0;
+                                return (
+                                  <div key={key} className="cbar-row">
+                                    <span className="cbar-label" style={{ color, fontSize: "0.52rem" }}>{label} {pct}%</span>
+                                    <div className="cbar-track">
+                                      <div className="cbar-fill" style={{ width: `${(val * 100).toFixed(0)}%`, background: color }} />
+                                    </div>
+                                    <span className="cbar-pct">{(val * 100).toFixed(0)}%</span>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          )}
+                          {/* Per-criterion scores */}
                           {Object.keys(row.criterion_scores || {}).length > 0 && (
                             <div className="crit-bars">
                               {Object.entries(row.criterion_scores).map(([col, score]) => (
