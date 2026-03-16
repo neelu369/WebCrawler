@@ -18,17 +18,17 @@ class Configuration:
     )
 
     max_search_results: int = field(
-        default=10,
+        default=15,
         metadata={"description": "Max results per Tavily search query."},
     )
 
     min_word_count: int = field(
-        default=200,
+        default=100,
         metadata={"description": "Minimum word count to pass the crawler quality gate."},
     )
 
     min_credibility: float = field(
-        default=0.65,
+        default=0.5,
         metadata={"description": "Minimum credibility score (0-1) to keep a source."},
     )
 

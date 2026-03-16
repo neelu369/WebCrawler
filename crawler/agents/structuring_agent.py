@@ -14,7 +14,19 @@ from typing import Any
 import replicate
 
 from crawler.cost_tracker import tracker
-from crawler.vector.chroma_kb import ChromaKnowledgeBase
+
+
+def _get_chroma_class():
+    """Lazy import of ChromaKnowledgeBase — avoids DLL load at startup."""
+    try:
+        from crawler.vector.chroma_kb import ChromaKnowledgeBase
+        return ChromaKnowledgeBase
+    except (ImportError, Exception) as exc:
+        raise RuntimeError(
+            f"ChromaDB is not available: {exc}\n"
+            "The A2A structuring path requires chromadb. "
+            "The primary ranking path (Neo4j) works without it."
+        ) from exc
 
 _MAX_DATA_CHARS = 8000 * 4
 _ENTITY_SUMMARY_CHARS = 400
@@ -141,6 +153,7 @@ No markdown, no explanation."""
 class StructuringAgent:
 
     def __init__(self, *, chroma_persist_dir: str = "./chroma_db", chroma_entity_collection: str = "crawler_entities", chroma_embedding_dim: int = 384, model: str = "meta/meta-llama-3-70b-instruct", max_chroma_records: int = 500) -> None:
+        ChromaKnowledgeBase = _get_chroma_class()
         self.kb = ChromaKnowledgeBase(persist_dir=chroma_persist_dir, collection_name=chroma_entity_collection, embedding_dimensions=chroma_embedding_dim)
         self.model = model
         self.max_chroma_records = max_chroma_records

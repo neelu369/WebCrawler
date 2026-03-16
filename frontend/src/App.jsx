@@ -124,6 +124,17 @@ const css = `
   /* Query */
   .query-label { font-size:0.65rem; letter-spacing:0.2em; text-transform:uppercase; color:var(--muted); margin-bottom:0.75rem; }
   .query-row   { display:flex; gap:0.75rem; margin-bottom:2.5rem; }
+  .topn-wrap   { display:flex; flex-direction:column; gap:0.3rem; flex-shrink:0; }
+  .topn-label  { font-size:0.55rem; color:var(--muted); letter-spacing:0.15em; text-transform:uppercase; }
+  .topn-input  {
+    width:72px; background:var(--surface); border:1px solid var(--border);
+    color:var(--accent); font-family:var(--mono); font-size:1rem; font-weight:600;
+    padding:0.85rem 0.5rem; text-align:center; outline:none;
+    transition:border-color 0.2s; -moz-appearance:textfield;
+  }
+  .topn-input::-webkit-inner-spin-button,
+  .topn-input::-webkit-outer-spin-button { -webkit-appearance:none; }
+  .topn-input:focus { border-color:var(--accent); }
   .query-input {
     flex:1; background:var(--surface); border:1px solid var(--border);
     color:var(--text); font-family:var(--mono); font-size:0.9rem;
@@ -318,6 +329,7 @@ function getHostname(url) {
 // ── App ───────────────────────────────────────────────────────
 export default function App() {
   const [query,       setQuery]       = useState("");
+  const [topN,        setTopN]        = useState(10);
   const [jobId,       setJobId]       = useState(null);
   const [jobStatus,   setJobStatus]   = useState("idle");
   const [events,      setEvents]      = useState([]);
@@ -355,7 +367,7 @@ export default function App() {
       const res  = await fetch(`${API}/crawl/rank`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query }),
+        body: JSON.stringify({ query, top_n: topN }),
       });
       const data = await res.json();
       const id   = data.job_id;
@@ -435,6 +447,18 @@ export default function App() {
             onKeyDown={e => e.key === "Enter" && startPipeline()}
             placeholder="e.g. Rank top English movies by IMDB rating"
           />
+          <div className="topn-wrap">
+            <span className="topn-label">Top N</span>
+            <input
+              className="topn-input"
+              type="number"
+              min={1}
+              max={100}
+              value={topN}
+              onChange={e => setTopN(Math.max(1, Math.min(100, parseInt(e.target.value) || 10)))}
+              title="How many results to return (1–100)"
+            />
+          </div>
           <button
             className="run-btn"
             onClick={startPipeline}

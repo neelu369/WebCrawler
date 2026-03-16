@@ -142,13 +142,26 @@ class ValidatorAgent:
         chroma_embedding_dim: int = 384,
         max_scan_records: int = 1000,
     ) -> None:
-        from crawler.vector import ChromaKnowledgeBase
-        self.kb = ChromaKnowledgeBase(
-            persist_dir=chroma_persist_dir,
-            collection_name=chroma_entity_collection,
-            embedding_dimensions=chroma_embedding_dim,
-        )
+        # Store config — don't load ChromaDB until validate() is called
+        self._persist_dir   = chroma_persist_dir
+        self._collection    = chroma_entity_collection
+        self._embed_dim     = chroma_embedding_dim
         self.max_scan_records = max_scan_records
+        self._kb = None  # lazy
+
+    def _get_kb(self):
+        if self._kb is None:
+            try:
+                from crawler.vector import ChromaKnowledgeBase
+                self._kb = ChromaKnowledgeBase(
+                    persist_dir=self._persist_dir,
+                    collection_name=self._collection,
+                    embedding_dimensions=self._embed_dim,
+                )
+            except (ImportError, Exception) as exc:
+                print(f"[ValidatorAgent] ChromaDB unavailable: {exc}. Validation will report no data.")
+                return None
+        return self._kb
 
     def validate(
         self,
@@ -171,7 +184,11 @@ class ValidatorAgent:
             return {"sufficient": False, "no_data_available": True,
                     "available_metrics": [], "missing_metrics": required_metrics, "entity_count": 0}
 
-        records = self.kb.get_records(where={"session_id": session_id}, limit=self.max_scan_records)
+        kb = self._get_kb()
+        if kb is None:
+            return {"sufficient": False, "no_data_available": True,
+                    "available_metrics": [], "missing_metrics": required_metrics, "entity_count": 0}
+        records = kb.get_records(where={"session_id": session_id}, limit=self.max_scan_records)
         entity_records = [r for r in records if (r.get("metadata") or {}).get("record_type") == "entity"]
 
         if not entity_records:

@@ -1,26 +1,46 @@
-"""Ranking Engine — deterministic + LLM-assisted ranking of Neo4j StructuredResults.
+"""Ranking Engine — multi-algorithm ranking for any type of entity data.
 
-This is the authoritative ranking pipeline. It takes StructuredResult objects
-produced by GraphStructurer (from Neo4j) and produces a fully ranked table.
+Algorithms used (combined via ensemble):
+─────────────────────────────────────────────────────────────────────────
+1. TOPSIS  (Technique for Order of Preference by Similarity to Ideal Solution)
+   - Finds the "ideal best" and "ideal worst" across all numeric columns
+   - Scores each entity by its relative distance to ideal vs anti-ideal
+   - Handles both higher-is-better and lower-is-better criteria correctly
+   - Industry standard for multi-criteria decision making (MCDM)
 
-Algorithm:
-  1. Build a flat feature matrix from each entity's properties + relationships.
-  2. Ask the LLM to select and weight the most relevant columns for the query.
-  3. Parse numeric values from each cell (handles $1.2M, 45%, "3 years", etc.)
-  4. Min-max normalise each column to [0, 1].
-  5. Compute weighted composite score per entity.
-  6. Sort descending → ranked table.
-  7. If LLM criteria selection fails, fall back to equal-weight scoring.
+2. Borda Count  (rank aggregation across individual columns)
+   - For each criterion column, sort entities and assign rank positions
+   - Sum rank positions across all criteria (lower = better)
+   - Works on ANY data — numeric, ordinal, categorical
+   - Robust to outliers and missing values
 
-Integration:
-  Called directly from api.py after the LangGraph pipeline completes.
-  Input:  list[StructuredResult]  (from state.structured_results)
-  Output: RankingResult dataclass  (.to_dict() for JSON serialisation)
+3. Weighted Frequency Score  (for categorical / text fields)
+   - Counts meaningful non-null values per entity across all columns
+   - Rewards entities with richer, more complete data
+   - Acts as a completeness tiebreaker
+
+Ensemble:
+   final_score = w_topsis * topsis_score
+               + w_borda  * borda_score
+               + w_freq   * completeness_score
+
+   Default weights: TOPSIS 55%, Borda 35%, Completeness 10%
+   All weights sum to 1.0.
+
+LLM role:
+   - Selects WHICH columns are relevant for the query
+   - Assigns per-column weights (how important each criterion is)
+   - Sets higher_is_better direction per column
+   - Does NOT do scoring — all scoring is deterministic math
+
+Works for: movies, startups, universities, stocks, people, places, products —
+anything that can be described with named properties.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import re
 import time
 from dataclasses import dataclass, field
@@ -32,150 +52,174 @@ from crawler.cost_tracker import tracker
 from crawler.models import StructuredResult
 
 
+# ── Constants ─────────────────────────────────────────────────
+TOPSIS_WEIGHT      = 0.55
+BORDA_WEIGHT       = 0.35
+COMPLETENESS_WEIGHT= 0.10
+
+_MISSING_VALUES = frozenset({
+    "", "n/a", "na", "null", "none", "not available", "not found",
+    "unknown", "-", "–", "?", "not specified", "not disclosed",
+    "not mentioned", "none mentioned",
+})
+
+
 # ── Data models ───────────────────────────────────────────────
 
 @dataclass
 class RankingCriterion:
-    """One weighted column used in the composite score."""
     column: str
-    weight: float           # normalised to sum to 1.0 across all criteria
+    weight: float
     higher_is_better: bool = True
     rationale: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "column": self.column,
-            "weight": round(self.weight, 4),
+            "column":           self.column,
+            "weight":           round(self.weight, 4),
             "higher_is_better": self.higher_is_better,
-            "rationale": self.rationale,
+            "rationale":        self.rationale,
+        }
+
+
+@dataclass
+class AlgorithmScores:
+    """Per-algorithm scores for transparency."""
+    topsis:       float = 0.0
+    borda:        float = 0.0
+    completeness: float = 0.0
+
+    def to_dict(self) -> dict[str, float]:
+        return {
+            "topsis":       round(self.topsis, 4),
+            "borda":        round(self.borda, 4),
+            "completeness": round(self.completeness, 4),
         }
 
 
 @dataclass
 class RankedEntity:
-    """One entity with its rank, scores, and all displayable fields."""
-    rank: int
-    name: str
-    entity_type: str
-    description: str
-    composite_score: float
-    criterion_scores: dict[str, float]  # per-column normalised score [0,1]
-    properties: dict[str, str]          # raw property values from Neo4j
-    relationships: list[dict[str, str]] # {type, target} from Neo4j
-    source_urls: list[str]
-    missing_criteria: list[str]         # criteria columns with no numeric value
+    rank:             int
+    name:             str
+    entity_type:      str
+    description:      str
+    composite_score:  float
+    algorithm_scores: AlgorithmScores
+    criterion_scores: dict[str, float]   # per-column normalised scores
+    properties:       dict[str, str]
+    relationships:    list[dict[str, str]]
+    source_urls:      list[str]
+    missing_criteria: list[str]
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "rank": self.rank,
-            "name": self.name,
-            "entity_type": self.entity_type,
-            "description": self.description,
-            "composite_score": round(self.composite_score, 4),
+            "rank":             self.rank,
+            "name":             self.name,
+            "entity_type":      self.entity_type,
+            "description":      self.description,
+            "composite_score":  round(self.composite_score, 4),
+            "algorithm_scores": self.algorithm_scores.to_dict(),
             "criterion_scores": {k: round(v, 4) for k, v in self.criterion_scores.items()},
-            "properties": self.properties,
-            "relationships": self.relationships,
-            "source_urls": self.source_urls,
+            "properties":       self.properties,
+            "relationships":    self.relationships,
+            "source_urls":      self.source_urls,
             "missing_criteria": self.missing_criteria,
         }
 
 
 @dataclass
 class RankingResult:
-    """Full output of the RankingEngine."""
-    user_query: str
-    session_id: str
+    user_query:        str
+    session_id:        str
     ranking_rationale: str
-    criteria: list[RankingCriterion]
-    entities: list[RankedEntity]
-    all_columns: list[str]          # every property column across all entities
-    total_entities: int
-    algorithm: str = "weighted_minmax_composite"
+    criteria:          list[RankingCriterion]
+    entities:          list[RankedEntity]
+    all_columns:       list[str]
+    total_entities:    int
+    algorithm:         str = "topsis+borda+completeness_ensemble"
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "user_query": self.user_query,
-            "session_id": self.session_id,
+            "user_query":        self.user_query,
+            "session_id":        self.session_id,
             "ranking_rationale": self.ranking_rationale,
-            "algorithm": self.algorithm,
-            "criteria": [c.to_dict() for c in self.criteria],
-            "entities": [e.to_dict() for e in self.entities],
-            "all_columns": self.all_columns,
-            "total_entities": self.total_entities,
+            "algorithm":         self.algorithm,
+            "criteria":          [c.to_dict() for c in self.criteria],
+            "entities":          [e.to_dict() for e in self.entities],
+            "all_columns":       self.all_columns,
+            "total_entities":    self.total_entities,
         }
 
 
-# ── LLM prompt ────────────────────────────────────────────────
+# ── Value extraction ──────────────────────────────────────────
 
-_CRITERIA_PROMPT = """\
-You are a ranking expert. A user asked a ranking question. You have structured entity data.
+def _is_missing(value: Any) -> bool:
+    if value is None:
+        return True
+    return str(value).strip().lower() in _MISSING_VALUES
 
-User's ranking question:
-{query}
-
-Available property columns (extracted from a knowledge graph):
-{columns}
-
-Sample entities (first 3) with their property values:
-{sample_entities}
-
-Task:
-1. Select the columns that are MOST RELEVANT for answering this ranking question.
-   Only pick columns that contain meaningful comparable data (skip names, URLs, descriptions).
-2. Assign a weight (0.0–1.0) to each — weights MUST sum exactly to 1.0.
-3. Set higher_is_better: true if a higher value means better (e.g. funding, rating, score).
-   Set higher_is_better: false if lower means better (e.g. equity taken, cost, time to market).
-4. Write one sentence explaining the overall ranking rationale.
-
-Return ONLY valid JSON in this exact shape, no markdown, no explanation:
-{{
-  "ranking_rationale": "One sentence.",
-  "criteria": [
-    {{
-      "column": "Exact Column Name",
-      "weight": 0.35,
-      "higher_is_better": true,
-      "rationale": "Why this column matters for this query."
-    }}
-  ]
-}}
-"""
-
-
-# ── Numeric extraction ────────────────────────────────────────
 
 def _extract_number(value: Any) -> float | None:
     """
-    Extract a float from heterogeneous cell values.
-    Handles: "$1.2M", "45%", "₹500 Cr", "1,200", "~3 years", "Top 10" → 10
-    Returns None if no numeric content found.
+    Extract a float from any cell value.
+    Handles: "$1.2M", "₹500 Cr", "45%", "9.2/10", "3 years", "Top 10", "1,200"
+    Also handles ordinal text: "Very High" → 5, "High" → 4, "Medium" → 3, etc.
     """
-    if value is None:
+    if _is_missing(value):
         return None
     text = str(value).strip()
-    if not text or text.lower() in {"n/a", "null", "none", "unknown", "not available", "-", "–", ""}:
-        return None
 
-    # Strip currency symbols, commas, spaces, tildes
+    # Ordinal/categorical text mappings — common across all domains
+    _ORDINAL_MAP = {
+        # Difficulty / intensity
+        "extremely high": 6.0, "very high": 5.0, "high": 4.0,
+        "moderate": 3.0, "medium": 3.0, "average": 3.0,
+        "low": 2.0, "very low": 1.0, "minimal": 1.0,
+        # Ratings
+        "excellent": 5.0, "very good": 4.0, "good": 3.5,
+        "fair": 2.5, "poor": 1.5, "very poor": 1.0,
+        # Frequency
+        "always": 5.0, "usually": 4.0, "often": 3.5,
+        "sometimes": 2.5, "rarely": 1.5, "never": 1.0,
+        # Size
+        "very large": 5.0, "large": 4.0, "medium": 3.0,
+        "small": 2.0, "very small": 1.0,
+        # Tier
+        "tier 1": 5.0, "tier 2": 4.0, "tier 3": 3.0, "tier 4": 2.0,
+        # Yes/No
+        "yes": 1.0, "no": 0.0, "true": 1.0, "false": 0.0,
+    }
+    text_lower = text.lower().strip()
+    if text_lower in _ORDINAL_MAP:
+        return _ORDINAL_MAP[text_lower]
+
+    # Handle "X/Y" rating format — convert to percentage
+    m = re.match(r"^(\d+\.?\d*)\s*/\s*(\d+\.?\d*)$", text)
+    if m:
+        try:
+            return float(m.group(1)) / float(m.group(2))
+        except (ValueError, ZeroDivisionError):
+            pass
+
+    # Strip currency, commas, percent, whitespace, tildes
     cleaned = re.sub(r"[,$%₹€£¥~\s]", "", text)
 
-    # Magnitude suffixes (Indian numbering too)
-    multipliers = {
-        "b":   1_000_000_000,
-        "bn":  1_000_000_000,
-        "m":   1_000_000,
-        "mn":  1_000_000,
-        "cr":  10_000_000,   # Indian crore
-        "lac": 100_000,
-        "lac": 100_000,
-        "lakh":100_000,
-        "k":   1_000,
-    }
-    lower_clean = cleaned.lower()
-    for suffix, mult in sorted(multipliers.items(), key=lambda x: -len(x[0])):
-        if lower_clean.endswith(suffix):
+    # Magnitude suffixes — longest first to avoid partial matches
+    multipliers = [
+        ("bn",    1_000_000_000),
+        ("b",     1_000_000_000),
+        ("mn",    1_000_000),
+        ("m",     1_000_000),
+        ("lakh",  100_000),
+        ("lac",   100_000),
+        ("cr",    10_000_000),
+        ("k",     1_000),
+    ]
+    lower = cleaned.lower()
+    for suffix, mult in multipliers:
+        if lower.endswith(suffix):
             try:
-                return float(lower_clean[: -len(suffix)]) * mult
+                return float(lower[: -len(suffix)]) * mult
             except ValueError:
                 pass
 
@@ -185,7 +229,7 @@ def _extract_number(value: Any) -> float | None:
     except ValueError:
         pass
 
-    # Extract first number from mixed string e.g. "Top 10 startups" → 10
+    # Extract first number from mixed text e.g. "Rank 5", "Top 10", "3 years"
     m = re.search(r"[-+]?\d+\.?\d*", text)
     if m:
         try:
@@ -196,47 +240,21 @@ def _extract_number(value: Any) -> float | None:
     return None
 
 
-# ── Normalisation ─────────────────────────────────────────────
-
-def _minmax_normalise(
-    values: list[float | None],
-    *,
-    higher_is_better: bool,
-) -> list[float]:
-    """
-    Min-max normalise to [0, 1].
-    None values → 0.0 (treated as worst possible score).
-    If all values are the same, everyone scores 0.5.
-    """
-    numeric = [v for v in values if v is not None]
-    if not numeric:
-        return [0.0] * len(values)
-
-    mn, mx = min(numeric), max(numeric)
-    spread = mx - mn if mx != mn else None
-
-    normalised: list[float] = []
-    for v in values:
-        if v is None:
-            normalised.append(0.0)
-        elif spread is None:
-            # All values equal — neutral score
-            normalised.append(0.5)
-        else:
-            score = (v - mn) / spread
-            normalised.append(score if higher_is_better else 1.0 - score)
-    return normalised
+def _cell_has_value(value: Any) -> bool:
+    """True if the cell contains any meaningful content."""
+    if _is_missing(value):
+        return False
+    return bool(str(value).strip())
 
 
-# ── Feature matrix builder ────────────────────────────────────
+# ── Feature matrix ────────────────────────────────────────────
 
 def _build_feature_matrix(
     entities: list[StructuredResult],
 ) -> tuple[list[str], list[dict[str, str]]]:
     """
-    Collect all unique property keys across all entities.
-    Also flatten relationships into property-style entries.
-    Returns (all_columns, list_of_flat_dicts).
+    Collect all property keys + flattened relationship types.
+    Returns (all_columns, flat_row_per_entity).
     """
     all_keys: set[str] = set()
     flat_rows: list[dict[str, str]] = []
@@ -244,19 +262,15 @@ def _build_feature_matrix(
     for entity in entities:
         row: dict[str, str] = {}
 
-        # Primary: typed properties from Neo4j
         for k, v in entity.properties.items():
             all_keys.add(k)
             row[k] = str(v)
 
-        # Secondary: flatten relationships as "Type: Target"
-        # e.g. {"type": "Supports Industry", "target": "Fintech"} → "Supports Industry": "Fintech"
         for rel in entity.relationships:
             rel_type = rel.get("type", "")
-            target = rel.get("target", "")
+            target   = rel.get("target", "")
             if rel_type and target:
                 all_keys.add(rel_type)
-                # If multiple values for same type, concatenate
                 if rel_type in row:
                     row[rel_type] = f"{row[rel_type]}, {target}"
                 else:
@@ -264,27 +278,243 @@ def _build_feature_matrix(
 
         flat_rows.append(row)
 
-    # Sort columns: shorter/simpler names first, then alphabetical
     all_columns = sorted(all_keys, key=lambda c: (len(c), c))
     return all_columns, flat_rows
 
 
-# ── LLM criteria selector ─────────────────────────────────────
+# ── Algorithm 1: TOPSIS ───────────────────────────────────────
 
-def _select_criteria_via_llm(
-    user_query: str,
-    all_columns: list[str],
+def _run_topsis(
     flat_rows: list[dict[str, str]],
+    criteria:  list[RankingCriterion],
+) -> tuple[list[float], dict[str, list[float]]]:
+    """
+    TOPSIS: Technique for Order Preference by Similarity to Ideal Solution.
+
+    Steps:
+      1. Build decision matrix (numeric values per entity per criterion)
+      2. Normalise using vector normalisation: r_ij = x_ij / sqrt(sum(x^2))
+      3. Apply weights: v_ij = w_j * r_ij
+      4. Find ideal best (A+) and ideal worst (A-) per criterion
+      5. Compute Euclidean distance from each entity to A+ and A-
+      6. Score = d- / (d+ + d-)  → 1.0 means closest to ideal
+
+    Returns:
+      scores          list[float] — TOPSIS score per entity (0..1)
+      criterion_scores dict       — per-criterion normalised score per entity
+    """
+    n = len(flat_rows)
+    if n == 0 or not criteria:
+        return [0.5] * n, {}
+
+    # Step 1: raw numeric matrix
+    raw: dict[str, list[float | None]] = {}
+    for crit in criteria:
+        raw[crit.column] = [_extract_number(row.get(crit.column)) for row in flat_rows]
+
+    # Step 2: vector normalisation per column
+    normalised: dict[str, list[float]] = {}
+    for crit in criteria:
+        vals = raw[crit.column]
+        numeric = [v for v in vals if v is not None]
+        if not numeric:
+            normalised[crit.column] = [0.0] * n
+            continue
+        col_norm = math.sqrt(sum(v * v for v in numeric))
+        if col_norm == 0:
+            normalised[crit.column] = [0.0] * n
+            continue
+        normalised[crit.column] = [
+            (v / col_norm if v is not None else 0.0)
+            for v in vals
+        ]
+
+    # Step 3: weighted normalised matrix
+    weighted: dict[str, list[float]] = {
+        crit.column: [v * crit.weight for v in normalised[crit.column]]
+        for crit in criteria
+    }
+
+    # Step 4: ideal best (A+) and ideal worst (A-)
+    ideal_best:  dict[str, float] = {}
+    ideal_worst: dict[str, float] = {}
+    for crit in criteria:
+        vals = [v for v in weighted[crit.column] if v != 0.0] or [0.0]
+        if crit.higher_is_better:
+            ideal_best[crit.column]  = max(vals)
+            ideal_worst[crit.column] = min(vals)
+        else:
+            ideal_best[crit.column]  = min(vals)
+            ideal_worst[crit.column] = max(vals)
+
+    # Step 5: distances
+    d_plus  = [0.0] * n
+    d_minus = [0.0] * n
+    for i in range(n):
+        dp = dm = 0.0
+        for crit in criteria:
+            v  = weighted[crit.column][i]
+            dp += (v - ideal_best[crit.column])  ** 2
+            dm += (v - ideal_worst[crit.column]) ** 2
+        d_plus[i]  = math.sqrt(dp)
+        d_minus[i] = math.sqrt(dm)
+
+    # Step 6: TOPSIS score
+    topsis_scores = [
+        (d_minus[i] / (d_plus[i] + d_minus[i]))
+        if (d_plus[i] + d_minus[i]) > 0
+        else 0.5
+        for i in range(n)
+    ]
+
+    # Per-criterion contribution scores (for display)
+    criterion_scores: dict[str, list[float]] = {}
+    for crit in criteria:
+        col_max = max(normalised[crit.column]) if any(v > 0 for v in normalised[crit.column]) else 1.0
+        if col_max == 0:
+            criterion_scores[crit.column] = [0.0] * n
+        else:
+            raw_norm = [v / col_max for v in normalised[crit.column]]
+            criterion_scores[crit.column] = raw_norm if crit.higher_is_better else [1.0 - v for v in raw_norm]
+
+    return topsis_scores, criterion_scores
+
+
+# ── Algorithm 2: Borda Count ──────────────────────────────────
+
+def _run_borda(
+    flat_rows: list[dict[str, str]],
+    criteria:  list[RankingCriterion],
+) -> list[float]:
+    """
+    Borda Count: rank aggregation across all criteria.
+
+    For each criterion:
+      - Sort entities by that criterion (numeric if possible, else lexicographic)
+      - Assign Borda points: best entity gets N-1 points, worst gets 0
+      - Weight the points by criterion weight
+
+    Final score = sum(weighted borda points) / max_possible → [0, 1]
+
+    Works for ANY data type — numeric, text, categorical, mixed.
+    """
+    n = len(flat_rows)
+    if n == 0 or not criteria:
+        return [0.5] * n
+
+    total_points = [0.0] * n
+
+    for crit in criteria:
+        col_vals = [flat_rows[i].get(crit.column) for i in range(n)]
+
+        # Try numeric sort first
+        numeric_vals = [(i, _extract_number(v)) for i, v in enumerate(col_vals)]
+        has_numeric  = any(v is not None for _, v in numeric_vals)
+
+        if has_numeric:
+            # Entities with no numeric value get 0 points (treated as worst)
+            def sort_key(iv: tuple[int, float | None]) -> float:
+                return iv[1] if iv[1] is not None else -math.inf
+            sorted_indices = sorted(numeric_vals, key=sort_key, reverse=crit.higher_is_better)
+        else:
+            # Lexicographic sort for text/categorical
+            def lex_key(iv: tuple[int, Any]) -> str:
+                return str(iv[1]).lower() if not _is_missing(iv[1]) else ""
+            sorted_indices = sorted(enumerate(col_vals), key=lex_key, reverse=crit.higher_is_better)
+
+        # Assign Borda points — handle ties by giving tied entities the same score
+        borda_points = [0.0] * n
+        prev_val     = object()
+        prev_pts     = 0.0
+        for rank_pos, (i, val) in enumerate(sorted_indices):
+            pts = (n - 1 - rank_pos) * crit.weight
+            if val == prev_val:
+                pts = prev_pts  # tied — same points
+            borda_points[i] = pts
+            prev_val = val
+            prev_pts = pts
+
+        for i in range(n):
+            total_points[i] += borda_points[i]
+
+    # Normalise to [0, 1]
+    max_pts = max(total_points) if any(p > 0 for p in total_points) else 1.0
+    return [p / max_pts for p in total_points]
+
+
+# ── Algorithm 3: Completeness score ──────────────────────────
+
+def _run_completeness(
+    flat_rows:   list[dict[str, str]],
+    all_columns: list[str],
+) -> list[float]:
+    """
+    Completeness score: fraction of non-missing cells across all columns.
+    Rewards entities with richer, more complete data.
+    Acts as tiebreaker when other scores are equal.
+    """
+    n = len(flat_rows)
+    if n == 0 or not all_columns:
+        return [0.0] * n
+
+    scores = []
+    for row in flat_rows:
+        filled = sum(1 for col in all_columns if _cell_has_value(row.get(col)))
+        scores.append(filled / len(all_columns))
+    return scores
+
+
+# ── LLM criteria selection ────────────────────────────────────
+
+_CRITERIA_PROMPT = """\
+You are a ranking expert. A user wants to rank entities based on a question.
+
+User's ranking question:
+{query}
+
+Available data columns (extracted from a knowledge graph):
+{columns}
+
+Sample entities (first 3) showing their actual data values:
+{sample_entities}
+
+Task — select the best columns for ranking this specific query:
+1. Pick columns with meaningful comparable data. Skip name, URL, description columns.
+2. Assign a weight (0.0–1.0) to each selected column. Weights MUST sum exactly to 1.0.
+3. Set higher_is_better:
+   - true  → higher value = better (e.g. rating, funding, score, revenue)
+   - false → lower value = better (e.g. equity taken, cost, rank number, years to exit)
+4. Write one sentence explaining the overall ranking logic.
+
+Return ONLY valid JSON — no markdown, no explanation:
+{{
+  "ranking_rationale": "One sentence.",
+  "criteria": [
+    {{
+      "column": "Exact Column Name As Listed Above",
+      "weight": 0.40,
+      "higher_is_better": true,
+      "rationale": "Why this column matters for this query."
+    }}
+  ]
+}}
+"""
+
+
+def _select_criteria_llm(
+    user_query:  str,
+    all_columns: list[str],
+    flat_rows:   list[dict[str, str]],
     *,
     model: str,
 ) -> tuple[list[RankingCriterion], str]:
-    """Ask the LLM to pick and weight the best columns for this query."""
+    """Call LLM to select and weight ranking criteria."""
 
-    # Build a compact sample (first 3 entities, key fields only)
+    # Build compact sample showing real values
     sample = []
     for row in flat_rows[:3]:
-        # Keep at most 10 fields per sample entity to avoid token bloat
-        sample.append({k: v for k, v in list(row.items())[:10]})
+        # Only show columns that have actual values
+        sample.append({k: v for k, v in list(row.items())[:12] if _cell_has_value(v)})
 
     prompt = _CRITERIA_PROMPT.format(
         query=user_query,
@@ -296,36 +526,33 @@ def _select_criteria_via_llm(
     try:
         output = replicate.run(
             model,
-            input={"prompt": prompt, "max_tokens": 1024, "temperature": 0.15},
+            input={"prompt": prompt, "max_tokens": 1024, "temperature": 0.1},
         )
         raw = "".join(str(c) for c in output)
         tracker.record(
-            node="ranking_engine",
-            model=model,
-            input_tokens=len(prompt) // 4,
-            output_tokens=len(raw) // 4,
+            node="ranking_engine", model=model,
+            input_tokens=len(prompt) // 4, output_tokens=len(raw) // 4,
             latency_s=time.time() - t0,
         )
     except Exception as exc:
         print(f"[RankingEngine] LLM call failed: {exc}. Using equal weights.")
-        return _equal_weight_criteria(all_columns), "Equal weight assigned to all available columns."
+        return _equal_weight_criteria(all_columns), "Equal weight assigned to all columns (LLM unavailable)."
 
-    # Parse the LLM JSON
+    # Parse JSON
     try:
         cleaned = raw.strip()
         if cleaned.startswith("```"):
-            cleaned = cleaned.split("\n", 1)[1].rsplit("```", 1)[0]
-        # Find the JSON object
+            cleaned = cleaned.split("\n", 1)[1].rsplit("```", 1)[0].strip()
         idx = cleaned.find("{")
         if idx != -1:
             cleaned = cleaned[idx:]
-        parsed = json.loads(cleaned.strip())
+        parsed = json.loads(cleaned)
     except (json.JSONDecodeError, ValueError) as exc:
         print(f"[RankingEngine] LLM JSON parse failed: {exc}. Using equal weights.")
-        return _equal_weight_criteria(all_columns), "Equal weight assigned to all available columns."
+        return _equal_weight_criteria(all_columns), "Equal weight fallback."
 
-    rationale = parsed.get("ranking_rationale", "")
-    valid_cols = set(all_columns)
+    rationale   = parsed.get("ranking_rationale", "")
+    valid_cols  = set(all_columns)
     criteria: list[RankingCriterion] = []
 
     for item in parsed.get("criteria", []):
@@ -338,17 +565,14 @@ def _select_criteria_via_llm(
             weight = 0.0
         if weight <= 0:
             continue
-        criteria.append(
-            RankingCriterion(
-                column=col,
-                weight=weight,
-                higher_is_better=bool(item.get("higher_is_better", True)),
-                rationale=str(item.get("rationale", "")),
-            )
-        )
+        criteria.append(RankingCriterion(
+            column=col,
+            weight=weight,
+            higher_is_better=bool(item.get("higher_is_better", True)),
+            rationale=str(item.get("rationale", "")),
+        ))
 
     if not criteria:
-        print("[RankingEngine] No valid criteria from LLM. Falling back to equal weights.")
         return _equal_weight_criteria(all_columns), rationale or "Equal weight fallback."
 
     # Normalise weights to exactly 1.0
@@ -356,8 +580,6 @@ def _select_criteria_via_llm(
     if total > 0:
         for c in criteria:
             c.weight = round(c.weight / total, 6)
-
-    # Fix floating point drift: adjust last weight so sum == 1.0 exactly
     diff = 1.0 - sum(c.weight for c in criteria)
     if criteria:
         criteria[-1].weight = round(criteria[-1].weight + diff, 6)
@@ -370,124 +592,66 @@ def _select_criteria_via_llm(
 
 
 def _equal_weight_criteria(columns: list[str]) -> list[RankingCriterion]:
-    """Fallback: every column gets equal weight."""
-    # Only keep columns that look potentially numeric (skip pure-text ones)
-    candidates = [c for c in columns if c not in {"Description", "Name", "Entity Type", "Source"}]
-    if not candidates:
-        candidates = columns[:5] if columns else ["Score"]
-    n = len(candidates)
+    """Fallback: equal weight on all columns."""
+    # Skip pure-text columns unlikely to be rankable
+    candidates = [
+        c for c in columns
+        if c.lower() not in {"name", "description", "source", "url", "type", "entity type"}
+    ] or columns[:6]
+    n      = len(candidates) or 1
     weight = round(1.0 / n, 6)
-    criteria = [RankingCriterion(column=col, weight=weight, higher_is_better=True, rationale="Equal weight fallback.") for col in candidates]
-    # Fix sum drift
-    diff = 1.0 - sum(c.weight for c in criteria)
-    if criteria:
-        criteria[-1].weight = round(criteria[-1].weight + diff, 6)
-    return criteria
-
-
-# ── Core scoring ──────────────────────────────────────────────
-
-def _score_entities(
-    entities: list[StructuredResult],
-    flat_rows: list[dict[str, str]],
-    criteria: list[RankingCriterion],
-) -> list[tuple[StructuredResult, float, dict[str, float], list[str]]]:
-    """
-    For each entity compute:
-      - per-criterion normalised score [0,1]
-      - weighted composite score
-      - list of missing criteria (columns with no parseable number)
-
-    Returns list of (entity, composite_score, criterion_scores, missing_criteria).
-    """
-    if not criteria:
-        return [(e, 0.0, {}, []) for e in entities]
-
-    # Step 1: extract raw numeric values per criterion column
-    raw_values: dict[str, list[float | None]] = {}
-    for crit in criteria:
-        raw_values[crit.column] = [
-            _extract_number(row.get(crit.column))
-            for row in flat_rows
-        ]
-
-    # Step 2: normalise each column
-    normalised: dict[str, list[float]] = {
-        crit.column: _minmax_normalise(
-            raw_values[crit.column],
-            higher_is_better=crit.higher_is_better,
-        )
-        for crit in criteria
-    }
-
-    # Step 3: compute composite scores
-    results = []
-    for i, entity in enumerate(entities):
-        criterion_scores: dict[str, float] = {}
-        missing: list[str] = []
-        composite = 0.0
-
-        for crit in criteria:
-            norm_score = normalised[crit.column][i]
-            criterion_scores[crit.column] = norm_score
-            composite += crit.weight * norm_score
-
-            if raw_values[crit.column][i] is None:
-                missing.append(crit.column)
-
-        results.append((entity, composite, criterion_scores, missing))
-
-    return results
+    crits  = [RankingCriterion(column=col, weight=weight, higher_is_better=True, rationale="Equal weight fallback.") for col in candidates]
+    diff   = 1.0 - sum(c.weight for c in crits)
+    if crits:
+        crits[-1].weight = round(crits[-1].weight + diff, 6)
+    return crits
 
 
 # ── Geographic filter ─────────────────────────────────────────
 
 def _apply_geographic_filter(
-    entities: list[StructuredResult],
+    entities:   list[StructuredResult],
     user_query: str,
 ) -> list[StructuredResult]:
-    """
-    If the query has a clear geographic focus, remove entities whose
-    location properties explicitly contradict it.
-    """
-    query_lower = user_query.lower()
+    """Remove entities whose location contradicts the query's geographic focus."""
+    q = user_query.lower()
 
-    india_keywords = ["india", "indian", "delhi", "mumbai", "bangalore",
-                      "bengaluru", "hyderabad", "chennai", "pune", "kolkata"]
-    india_query = any(kw in query_lower for kw in india_keywords)
-
-    if not india_query:
-        return entities
-
-    _NON_INDIA = {"united states", "usa", "u.s.", "silicon valley",
-                  "san francisco", "new york", "london", "uk", "singapore",
-                  "europe", "australia", "canada"}
-    _GLOBAL_ONLY_NAMES = {
-        "openvc", "hf0", "hf0 residency", "soma capital fellowship",
-        "y combinator", "techstars", "500 startups", "sequoia arc",
+    geo_filters = {
+        "india":     ["united states", "usa", "u.s.", "silicon valley", "london", "uk", "singapore", "europe", "australia", "canada"],
+        "us":        ["india", "china", "europe", "australia"],
+        "uk":        ["india", "usa", "china", "australia"],
+        "europe":    ["india", "usa", "china", "australia"],
     }
 
-    filtered, excluded = [], []
+    target_region = None
+    for region in geo_filters:
+        keywords = [region] if region != "india" else ["india", "indian", "bangalore", "bengaluru", "mumbai", "delhi", "hyderabad", "chennai", "pune"]
+        if any(kw in q for kw in keywords):
+            target_region = region
+            break
+
+    if not target_region:
+        return entities
+
+    exclude = set(geo_filters[target_region])
+    filtered, removed = [], []
+
     for entity in entities:
-        name_lower = entity.name.strip().lower()
-        location = str(entity.properties.get("Located In")
-                       or entity.properties.get("Headquartered In")
-                       or entity.properties.get("Location", "")).lower()
+        location = str(
+            entity.properties.get("Located In")
+            or entity.properties.get("Headquartered In")
+            or entity.properties.get("Location", "")
+        ).lower()
 
-        location_mismatch = (
-            any(c in location for c in _NON_INDIA)
-            and "india" not in location
-            and bool(location)
-        )
-        name_mismatch = name_lower in _GLOBAL_ONLY_NAMES
+        contradicts = any(place in location for place in exclude) and target_region not in location and bool(location)
 
-        if location_mismatch or name_mismatch:
-            excluded.append(entity.name)
+        if contradicts:
+            removed.append(entity.name)
         else:
             filtered.append(entity)
 
-    if excluded:
-        print(f"[RankingEngine] Filtered {len(excluded)} off-target entities: {excluded[:5]}")
+    if removed:
+        print(f"[RankingEngine] Geo-filtered {len(removed)} off-target entities: {removed[:5]}")
 
     return filtered if filtered else entities
 
@@ -496,98 +660,114 @@ def _apply_geographic_filter(
 
 class RankingEngine:
     """
-    Takes Neo4j StructuredResult objects → RankingResult.
+    Multi-algorithm ranking engine for any type of entity data.
 
-    Full algorithm:
-      1. Build flat feature matrix from entity properties + relationships.
-      2. LLM selects and weights the most relevant columns for the query.
-      3. Min-max normalise each column.
-      4. Compute weighted composite score per entity.
-      5. Sort descending → assign ranks.
+    Ensemble of three algorithms:
+      TOPSIS      (55%) — multi-criteria distance from ideal solution
+      Borda Count (35%) — rank aggregation, works on any data type
+      Completeness(10%) — data richness tiebreaker
 
-    Falls back to equal-weight scoring if LLM call fails.
+    LLM selects relevant columns and weights; all scoring is deterministic math.
     """
 
-    def __init__(
-        self,
-        *,
-        model: str = "meta/meta-llama-3-70b-instruct",
-    ) -> None:
+    def __init__(self, *, model: str = "meta/meta-llama-3-70b-instruct") -> None:
         self.model = model
 
     def rank(
         self,
         *,
-        user_query: str,
-        session_id: str,
+        user_query:         str,
+        session_id:         str,
         structured_results: list[StructuredResult],
     ) -> RankingResult:
-        """
-        Main entry point.
 
-        Args:
-            user_query:         The original user question.
-            session_id:         Pipeline session ID (for traceability).
-            structured_results: Output of GraphStructurer from Neo4j.
-
-        Returns:
-            RankingResult with fully ranked entities + scoring breakdown.
-        """
         if not structured_results:
-            print("[RankingEngine] No structured results to rank.")
             return RankingResult(
-                user_query=user_query,
-                session_id=session_id,
+                user_query=user_query, session_id=session_id,
                 ranking_rationale="No entities found to rank.",
-                criteria=[],
-                entities=[],
-                all_columns=[],
-                total_entities=0,
+                criteria=[], entities=[], all_columns=[], total_entities=0,
             )
 
         # Step 1: geographic filter
-        filtered = _apply_geographic_filter(structured_results, user_query)
-        print(f"[RankingEngine] Ranking {len(filtered)} entities (after filter, was {len(structured_results)})")
+        entities = _apply_geographic_filter(structured_results, user_query)
+        print(f"[RankingEngine] {len(entities)} entities after geo-filter (was {len(structured_results)})")
 
-        # Step 2: build flat feature matrix
-        all_columns, flat_rows = _build_feature_matrix(filtered)
-        print(f"[RankingEngine] Feature matrix: {len(filtered)} entities × {len(all_columns)} columns")
-        print(f"[RankingEngine] Columns: {all_columns}")
+        # Step 2: feature matrix
+        all_columns, flat_rows = _build_feature_matrix(entities)
+        print(f"[RankingEngine] Feature matrix: {len(entities)} × {len(all_columns)} columns")
 
-        # Step 3: LLM criteria selection
-        criteria, rationale = _select_criteria_via_llm(
+        # Step 3: LLM selects criteria + weights
+        criteria, rationale = _select_criteria_llm(
             user_query, all_columns, flat_rows, model=self.model
         )
+        print(f"[RankingEngine] Criteria: {[(c.column, c.weight) for c in criteria]}")
 
-        # Step 4 + 5: normalise + score
-        scored = _score_entities(filtered, flat_rows, criteria)
+        n = len(entities)
 
-        # Step 6: sort descending by composite score
-        scored.sort(key=lambda x: x[1], reverse=True)
+        # Step 4: TOPSIS
+        topsis_scores, criterion_scores_per_col = _run_topsis(flat_rows, criteria)
+        print(f"[RankingEngine] TOPSIS scores: {[round(s, 3) for s in topsis_scores]}")
 
-        # Step 7: build ranked entities
+        # Step 5: Borda Count
+        borda_scores = _run_borda(flat_rows, criteria)
+        print(f"[RankingEngine] Borda scores: {[round(s, 3) for s in borda_scores]}")
+
+        # Step 6: Completeness
+        completeness_scores = _run_completeness(flat_rows, all_columns)
+
+        # Step 7: Ensemble composite
+        composite_scores = [
+            TOPSIS_WEIGHT       * topsis_scores[i]
+            + BORDA_WEIGHT      * borda_scores[i]
+            + COMPLETENESS_WEIGHT * completeness_scores[i]
+            for i in range(n)
+        ]
+
+        # Step 8: Sort and assign ranks
+        order = sorted(range(n), key=lambda i: composite_scores[i], reverse=True)
+
         ranked_entities: list[RankedEntity] = []
-        for rank_idx, (entity, composite, crit_scores, missing) in enumerate(scored, start=1):
-            ranked_entities.append(
-                RankedEntity(
-                    rank=rank_idx,
-                    name=entity.name,
-                    entity_type=entity.entity_type,
-                    description=entity.description,
-                    composite_score=composite,
-                    criterion_scores=crit_scores,
-                    properties=entity.properties,
-                    relationships=entity.relationships,
-                    source_urls=entity.source_urls,
-                    missing_criteria=missing,
-                )
-            )
+        for rank_pos, i in enumerate(order, start=1):
+            entity = entities[i]
+            row    = flat_rows[i]
+
+            # Per-criterion scores for display
+            crit_display = {
+                col: round(criterion_scores_per_col.get(col, [0.0] * n)[i], 4)
+                for col in criterion_scores_per_col
+            }
+
+            # Missing criteria = criteria columns with no parseable number
+            missing = [
+                crit.column for crit in criteria
+                if _extract_number(row.get(crit.column)) is None
+            ]
+
+            ranked_entities.append(RankedEntity(
+                rank=rank_pos,
+                name=entity.name,
+                entity_type=entity.entity_type,
+                description=entity.description,
+                composite_score=composite_scores[i],
+                algorithm_scores=AlgorithmScores(
+                    topsis=topsis_scores[i],
+                    borda=borda_scores[i],
+                    completeness=completeness_scores[i],
+                ),
+                criterion_scores=crit_display,
+                properties=entity.properties,
+                relationships=entity.relationships,
+                source_urls=entity.source_urls,
+                missing_criteria=missing,
+            ))
 
         if ranked_entities:
             top = ranked_entities[0]
             print(
                 f"[RankingEngine] #1: {top.name!r} "
-                f"composite={top.composite_score:.4f}"
+                f"composite={top.composite_score:.4f} "
+                f"(topsis={top.algorithm_scores.topsis:.3f}, "
+                f"borda={top.algorithm_scores.borda:.3f})"
             )
 
         return RankingResult(

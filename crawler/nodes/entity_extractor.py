@@ -32,52 +32,59 @@ def _clean_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 _PROMPT = """\
-You are a knowledge graph engineer. Extract SPECIFIC INDIVIDUAL ENTITIES that directly answer the user's query.
+You are a knowledge graph engineer building a ranking dataset. Extract ALL relevant entities and their comparative data.
 
 User query: {query}
 
 Text:
 {content}
 
-WHAT TO EXTRACT:
-- Extract ONLY specific, individual, named entities that directly answer the query.
-- For movie queries: extract individual FILM TITLES only (e.g. "The Godfather", "Inception").
-- For startup queries: extract individual COMPANY NAMES only.
-- For person queries: extract individual PERSON NAMES only.
+EXTRACTION RULES:
+1. Extract EVERY named entity relevant to this query (aim for all you can find).
+2. For EACH entity, extract as many measurable/comparable facts as possible:
+   - Numbers, percentages, scores, rates, counts, dates, ranks
+   - Difficulty levels, pass rates, cut-offs, application counts, seat counts
+   - Any data that could be used to compare entities
+3. If the text only lists names without data, still extract the names with entity_type and description.
+4. For exams: extract pass rate, number of applicants, difficulty level, conducting body, seats available, cut-off score.
+5. For movies: extract IMDB rating, box office, release year, director, genre.
+6. For companies: extract funding, valuation, founding year, location, industry.
 
-WHAT TO NEVER EXTRACT (these are NOT valid entities):
-- List titles or collection names (e.g. "Top 100 Movies", "Greatest Films By Decade", "Best Movies of All Time")
-- Website names, publication names, or source names (e.g. "IMDb", "Box Office Mojo", "Rotten Tomatoes")
-- Category labels (e.g. "English Movies", "Hollywood Films", "Action Genre")
-- Any entity that is a ranking list, a webpage, or a category — NOT a specific item
+NEVER extract:
+- Website names (IMDb, Wikipedia, etc.)
+- Pure category labels
 
-PREDICATES TO USE based on query type:
-- Movies: DIRECTED_BY, RELEASED_IN, HAS_IMDB_RATING, HAS_BOX_OFFICE, STARRING, HAS_GENRE, HAS_RUNTIME, HAS_RATING, WON_AWARD, PRODUCED_BY, SET_IN
-- Companies: LOCATED_IN, FOUNDED_IN, FOUNDED_BY, HAS_FUNDING, SUPPORTS_INDUSTRY, IS_TYPE_OF
-- People: BORN_IN, WORKS_AT, KNOWN_FOR, HAS_NATIONALITY
-- General: HAS_PROPERTY, IS_TYPE_OF, RELATED_TO
+entity_type options: Exam, Film, Company, Person, Organization, University, Technology, Competition, Event, Entity
 
-Return a JSON array where each element has EXACTLY these keys:
-  "name"           - the specific entity name (string)
-  "entity_type"    - Film, Company, Person, Organization, Technology, or Entity
-  "description"    - 1-2 sentence factual summary (string)
-  "priority_score" - relevance float 0.0 to 1.0
-  "triples"        - array of fact objects, each with EXACTLY:
-      "subject"          - same as entity name (string)
-      "predicate"        - UPPERCASE_SNAKE_CASE from the list above
-      "object"           - the actual fact value (string, NEVER null/unknown/N/A)
-      "evidence_snippet" - short quote from the text proving this fact
-      "confidence"       - float 0.0 to 1.0
+Return a JSON array. Each element:
+{{
+  "name": "exact entity name",
+  "entity_type": "Exam",
+  "description": "1-2 sentences",
+  "priority_score": 0.9,
+  "triples": [
+    {{
+      "subject": "entity name",
+      "predicate": "HAS_PASS_RATE",
+      "object": "0.1%",
+      "evidence_snippet": "only 0.1% candidates qualify",
+      "confidence": 0.95
+    }}
+  ]
+}}
 
-STRICT OUTPUT RULES:
-- Return ONLY a raw JSON array. No markdown, no explanation, no extra text.
-- Return [] if no valid individual entities are found.
-- Every triple must be a JSON object — never a plain string.
-- Skip any triple where the object is unknown, N/A, "not specified", or empty.
-- An entity with zero good triples should still be included if it is a real specific item.
+PREDICATES — use the most specific one:
+Exams: HAS_PASS_RATE, HAS_APPLICANTS, HAS_SEATS, HAS_CUTOFF, CONDUCTED_BY, HAS_DIFFICULTY, HELD_IN, REQUIRES_ELIGIBILITY, RANKED_AT
+Films: HAS_IMDB_RATING, HAS_BOX_OFFICE, DIRECTED_BY, RELEASED_IN, HAS_GENRE, HAS_RATING, HAS_BUDGET, WON_AWARD
+Companies: HAS_FUNDING, HAS_VALUATION, FOUNDED_IN, LOCATED_IN, FOUNDED_BY, SUPPORTS_INDUSTRY
+General: HAS_PROPERTY, IS_TYPE_OF, RELATED_TO, RANKED_AT, HAS_SCORE, HAS_RANK
 
-Example for a movie query:
-[{{"name":"The Godfather","entity_type":"Film","description":"1972 crime film directed by Francis Ford Coppola.","priority_score":0.95,"triples":[{{"subject":"The Godfather","predicate":"DIRECTED_BY","object":"Francis Ford Coppola","evidence_snippet":"directed by Francis Ford Coppola","confidence":0.99}},{{"subject":"The Godfather","predicate":"RELEASED_IN","object":"1972","evidence_snippet":"released in 1972","confidence":0.99}},{{"subject":"The Godfather","predicate":"HAS_IMDB_RATING","object":"9.2","evidence_snippet":"IMDb rating of 9.2","confidence":0.95}}]}}]
+STRICT RULES:
+- Return ONLY a raw JSON array, no markdown, no text outside the array.
+- Every triple must be a JSON object with all 5 keys — never a string.
+- Skip triples where object is null, N/A, unknown, or empty.
+- Include entities even with zero triples if they are real named items.
+- Aim for maximum coverage — extract every individual item in the text.
 """
 
 _PLACEHOLDER_VALUES = {"not specified","not mentioned","unknown","n/a","not disclosed","not available","not publicly disclosed","none mentioned"}
@@ -85,38 +92,30 @@ _PLACEHOLDER_VALUES = {"not specified","not mentioned","unknown","n/a","not disc
 # Patterns that indicate a list/website/category — not a real entity
 _JUNK_NAME_PATTERNS = re.compile(
     r"^("
-    r"top\s+\d+|greatest\s+\d*|best\s+\d*\s*|most\s+\d*|"
-    r"\d+\s+(greatest|best|top|highest)|"
-    r"all[- ]time|by\s+(decade|year|genre|director)|"
-    r"box\s+office|lifetime\s+gross(es)?|"
-    r"imdb\s+top|rotten\s+tomatoes|metacritic|afi\s+|"
-    r"greatest\s+(american|english|british|film|movie|series|franchise)|"
-    r"most\s+popular|highest\s+rated|hall\s+of\s+fame|"
-    r"the\s+21st\s+century|21st\s+century\s+movies|"
-    r"top\s+lifetime|empire\s+magazine|sight\s+&\s+sound|"
-    r"they\s+shoot\s+pictures|bfi\s+"
+    # Only block pure list/collection page titles — NOT individual items
+    r"list of \w|collection of \w|ranking of \w|"
+    # Website/publication names
+    r"imdb top|rotten tomatoes|metacritic|box office mojo|afi list|bfi list|"
+    r"sight & sound|empire magazine|they shoot pictures|"
+    # Pure category labels with no specific name
+    r"english movies$|hollywood films$|action genre$|comedy genre$"
     r")",
     re.IGNORECASE,
 )
 _JUNK_SUBSTRINGS = {
-    "list of", "films by", "movies by", "collection of", "series of",
-    "ranking of", "greatest films", "greatest movies", "100 films",
-    "100 movies", "box office", "all-time", "by decade", "by genre",
-    "by year", "top lifetime", "adjusted grosses",
+    "list of films", "list of movies", "collection of films",
+    "box office mojo", "rotten tomatoes top", "imdb top 250",
 }
-_JUNK_ENTITY_TYPES = {"list", "collection", "website", "publication", "source", "category", "ranking", "chart"}
+_JUNK_ENTITY_TYPES = {"website", "publication", "source"}
 
 def _is_junk_entity(name: str, entity_type: str) -> bool:
-    """Return True if this looks like a list page / website / category rather than a real entity."""
+    """Return True only if this is clearly a list/website — not a real named entity."""
     name_lower = name.lower().strip()
     if entity_type.lower() in _JUNK_ENTITY_TYPES:
         return True
     if _JUNK_NAME_PATTERNS.match(name_lower):
         return True
     if any(junk in name_lower for junk in _JUNK_SUBSTRINGS):
-        return True
-    # Reject names that are clearly website titles or editorial lists (contain " - " + org name)
-    if re.search(r"\s[-–]\s+(afi|bfi|imdb|rotten|metacritic|empire|sight)", name_lower):
         return True
     return False
 
@@ -128,7 +127,7 @@ async def extract_entities(state: State, config: Optional[RunnableConfig] = None
         prompt = _PROMPT.format(query=state.user_query, content=_clean_text(src.content)[:4000])
         t0 = time.time()
         try:
-            output = replicate.run(configuration.model, input={"prompt": prompt, "max_tokens": 2048, "temperature": 0.1})
+            output = replicate.run(configuration.model, input={"prompt": prompt, "max_tokens": 4096, "temperature": 0.1})
             raw_text = "".join(str(c) for c in output)
             tracker.record(node="entity_extractor", model=configuration.model, input_tokens=len(prompt)//4, output_tokens=len(raw_text)//4, latency_s=time.time()-t0)
 

@@ -78,8 +78,9 @@ def _sse(event: str, data: Any) -> str:
 
 class RankRequest(BaseModel):
     query: str = Field(..., description="The ranking question to research.")
+    top_n: int = Field(default=10, ge=1, le=100, description="How many top results to return.")
     max_retries: int = Field(default=2, ge=0, le=5)
-    min_credibility: float = Field(default=0.65, ge=0.0, le=1.0)
+    min_credibility: float = Field(default=0.5, ge=0.0, le=1.0)
 
 
 class A2ACrawlRequest(BaseModel):
@@ -102,7 +103,7 @@ class A2ACrawlResponse(BaseModel):
     cost_summary: dict[str, Any]
 
 
-async def _run_rank_pipeline(job_id: str, query: str, config: dict) -> None:
+async def _run_rank_pipeline(job_id: str, query: str, config: dict, top_n: int = 10) -> None:
     """
     Full pipeline:
       Phase 1 — LangGraph: crawl → extract → Neo4j → StructuredResults
@@ -198,6 +199,11 @@ async def _run_rank_pipeline(job_id: str, query: str, config: dict) -> None:
             structured_results=structured_results,
         )
 
+        # Apply top_n limit — keep only the top N ranked entities
+        if top_n and len(ranking_result.entities) > top_n:
+            ranking_result.entities = ranking_result.entities[:top_n]
+            ranking_result.total_entities = top_n
+
         top_name = ranking_result.entities[0].name if ranking_result.entities else "none"
         push("agent_message", {
             "from": "ranking_engine",
@@ -236,7 +242,7 @@ async def start_rank(request: RankRequest):
         "completed_at": None, "events": [], "ranking_result": None,
         "cost_summary": {}, "session_id": "", "error": None,
     }
-    asyncio.create_task(_run_rank_pipeline(job_id, request.query, {"max_retries": request.max_retries, "min_credibility": request.min_credibility}))
+    asyncio.create_task(_run_rank_pipeline(job_id, request.query, {"max_retries": request.max_retries, "min_credibility": request.min_credibility}, top_n=request.top_n))
     return {"job_id": job_id, "status": "running"}
 
 
