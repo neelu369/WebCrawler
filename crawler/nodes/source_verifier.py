@@ -15,7 +15,7 @@ import time
 from typing import Any, Optional
 from urllib.parse import urlparse
 
-import replicate
+from crawler.llm import replicate
 from langchain_core.runnables import RunnableConfig
 
 from crawler.config import Configuration
@@ -150,21 +150,37 @@ async def verify_sources(
             cred = 0.7 if is_trusted else 0.55
             rel  = 0.4 if is_list_page else 0.6
 
-        # Trusted domain boost
-        if is_trusted:
-            cred = min(1.0, cred + 0.1)
+        # Trusted domain — recorded as metadata for insights but does NOT
+        # boost the credibility score for filtering purposes.  All sources
+        # are evaluated equally; relevance is the primary gate.
 
         # List pages: keep if credible (they help discover entity names)
         # but cap relevance so detail pages score higher
         if is_list_page:
             rel = min(rel, 0.65)
 
-        passed = cred >= configuration.min_credibility
+        cred_ok = cred >= configuration.min_credibility
+        rel_ok  = rel  >= configuration.min_relevance
+        passed  = cred_ok and rel_ok
+
+        if not passed:
+            reject_reasons = []
+            if not cred_ok:
+                reject_reasons.append(f"cred {cred:.2f} < {configuration.min_credibility}")
+            if not rel_ok:
+                reject_reasons.append(f"rel {rel:.2f} < {configuration.min_relevance}")
+            reason_str = ", ".join(reject_reasons)
+        else:
+            reason_str = ""
+
         status = "✓" if passed else "✗"
-        print(
+        log_line = (
             f"[SourceVerifier] {status} {doc.url[:60]} | "
             f"{page_type} | cred={cred:.2f} rel={rel:.2f} trusted={is_trusted}"
         )
+        if reason_str:
+            log_line += f" | REJECTED: {reason_str}"
+        print(log_line)
 
         if passed:
             verified.append(VerifiedSource(
@@ -180,6 +196,7 @@ async def verify_sources(
     print(
         f"[SourceVerifier] {len(verified)}/{len(state.crawled_docs)} passed | "
         f"list_pages={list_page_count} detail_pages={detail_page_count} "
-        f"rejected={rejected_count} (min_cred={configuration.min_credibility})"
+        f"rejected={rejected_count} (min_cred={configuration.min_credibility}, "
+        f"min_rel={configuration.min_relevance})"
     )
     return {"verified_sources": verified}

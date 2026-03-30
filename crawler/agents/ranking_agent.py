@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-import replicate
+from crawler.llm import replicate
 
 from crawler.cost_tracker import tracker
 from crawler.agents.structuring_agent import StructuredTable, StructuredRow
@@ -105,7 +105,7 @@ def _normalise_column(values: list[float | None], *, higher_is_better: bool) -> 
 
 class RankingAgent:
 
-    def __init__(self, *, model: str = "meta/meta-llama-3-70b-instruct") -> None:
+    def __init__(self, *, model: str = "meta-llama/llama-3-70b-instruct") -> None:
         self.model = model
 
     def _call_llm(self, prompt: str, *, node_label: str) -> str:
@@ -162,21 +162,20 @@ class RankingAgent:
         return results
 
     def _filter_relevant_rows(self, rows: list[StructuredRow], user_query: str) -> list[StructuredRow]:
-        query_lower = user_query.lower()
-        india_query = any(kw in query_lower for kw in ["india","indian","delhi","mumbai","bangalore","bengaluru","hyderabad","chennai","pune","kolkata"])
-        if not india_query: return rows
-        _GLOBAL_ONLY = {"openvc","hf0","hf0 residency","soma capital fellowship","y combinator","techstars","500 startups","sequoia arc"}
-        filtered, excluded = [], []
-        for row in rows:
-            name_lower = row.entity_name.strip().lower()
-            location = str(row.fields.get("Location") or "").lower()
-            non_india = ["united states","usa","u.s.","silicon valley","san francisco","new york","london","uk","singapore"]
-            location_mismatch = any(c in location for c in non_india) and "india" not in location
-            name_mismatch = name_lower in _GLOBAL_ONLY
-            if location_mismatch or name_mismatch: excluded.append(row.entity_name)
-            else: filtered.append(row)
-        if excluded: print(f"[RankingAgent] Filtered {len(excluded)} non-India entities: {excluded[:5]}")
-        return filtered if filtered else rows
+        """Delegate geographic filtering to the shared utility."""
+        from crawler.utils import geo_filter_entities
+
+        # geo_filter_entities expects objects with .properties and .name;
+        # StructuredRow uses .fields and .entity_name. Wrap temporarily.
+        class _Adapter:
+            def __init__(self, row: StructuredRow):
+                self._row = row
+                self.name = row.entity_name
+                self.properties = row.fields
+
+        adapted = [_Adapter(r) for r in rows]
+        filtered = geo_filter_entities(adapted, user_query)
+        return [a._row for a in filtered]
 
     def rank(self, table: StructuredTable) -> RankedTable:
         if not table.rows:

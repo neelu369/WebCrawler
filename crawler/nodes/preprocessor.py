@@ -10,12 +10,11 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import re
 import time
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-import replicate
+from crawler.llm import replicate
 from langchain_core.runnables import RunnableConfig
 from motor.motor_asyncio import AsyncIOMotorClient
 
@@ -23,6 +22,7 @@ from crawler.config import Configuration
 from crawler.cost_tracker import tracker
 from crawler.models import ExtractedEntity
 from crawler.state import State
+from crawler.utils import clean_text as _clean_text
 
 _client: AsyncIOMotorClient | None = None
 _chroma_kb_cache: dict[tuple[str, str, int], Any] = {}
@@ -33,12 +33,7 @@ def _get_client() -> AsyncIOMotorClient:
     if _client is None:
         uri = os.getenv("MONGO_URI", "mongodb://localhost:27017")
         if not uri.startswith(("mongodb://", "mongodb+srv://")):
-            if uri.startswith(("bolt://", "neo4j://", "bolt+s://", "neo4j+s://")):
-                raise ValueError(
-                    f"[Preprocessor] MONGO_URI looks like a Neo4j URI: {uri!r}\n"
-                    "Fix .env: MONGO_URI=mongodb://localhost:27017"
-                )
-            raise ValueError(f"[Preprocessor] MONGO_URI invalid: {uri!r} — must start with mongodb://")
+            raise ValueError(f"[Preprocessor] MONGO_URI invalid: {uri!r}")
         _client = AsyncIOMotorClient(uri, serverSelectionTimeoutMS=5000)
     return _client
 
@@ -74,15 +69,6 @@ def _get_chroma_kb(configuration: Configuration):
     )
     _chroma_kb_cache[key] = kb
     return kb
-
-
-# ── Text cleaning ────────────────────────────────────────────
-def _clean_text(text: str) -> str:
-    """Strip leftover HTML artifacts and normalise whitespace."""
-    text = re.sub(r"<[^>]+>", " ", text)  # strip HTML tags
-    text = re.sub(r"&[a-zA-Z]+;", " ", text)  # HTML entities
-    text = re.sub(r"\s+", " ", text).strip()  # collapse whitespace
-    return text
 
 
 _EXTRACT_PROMPT = """\

@@ -41,6 +41,7 @@ _MERGE_ENTITY = (
     "ON CREATE SET e.name=$name, e.entity_type=$entity_type, e.description=$description, "
     "e.priority_score=$priority_score, e.session_id=$session_id, e.created_at=datetime() "
     "ON MATCH SET "
+    "e.session_id=$session_id, "
     "e.description=CASE WHEN size(e.description)<size($description) THEN $description ELSE e.description END, "
     "e.priority_score=CASE WHEN e.priority_score<$priority_score THEN $priority_score ELSE e.priority_score END, "
     "e.updated_at=datetime()"

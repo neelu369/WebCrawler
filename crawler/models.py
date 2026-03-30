@@ -78,3 +78,12 @@ class StructuredResult(BaseModel):
     citations: dict[str, CitationMetadata] = Field(default_factory=dict)
     source_urls: list[str] = Field(default_factory=list)
     priority_score: float = 0.0
+
+class DiscoveredMetric(BaseModel):
+    entity_name: str
+    metric_name: str
+    value: str
+    source_url: str
+
+class InvestigatorResponse(BaseModel):
+    findings: list[DiscoveredMetric] = Field(default_factory=list)

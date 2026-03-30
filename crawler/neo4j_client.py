@@ -25,8 +25,9 @@ def get_driver():
 async def check_neo4j_available() -> bool:
     """Ping Neo4j. Returns False instead of raising. Caches result."""
     global _neo4j_ok
-    if _neo4j_ok is not None:
-        return _neo4j_ok
+    # Cache only positive state. If Neo4j was previously down, retry on next call.
+    if _neo4j_ok is True:
+        return True
     try:
         driver = get_driver()
         await driver.verify_connectivity()
@@ -35,7 +36,7 @@ async def check_neo4j_available() -> bool:
         print(f"[Neo4j] ✅ Connected to {uri}")
         return True
     except Exception as exc:
-        _neo4j_ok = False
+        _neo4j_ok = None
         uri = os.getenv("NEO4J_URI", "bolt://localhost:7687")
         print(f"[Neo4j] ❌ Cannot connect to {uri}: {exc}")
         print("[Neo4j]    → Open Neo4j Desktop and click ▶ START on your instance")

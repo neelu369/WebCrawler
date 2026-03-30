@@ -1,14 +1,18 @@
 """Entity Extractor node — extracts triples for Neo4j knowledge graph."""
 from __future__ import annotations
-import json, os, re, time
+import json
+import os
+import re
+import time
 from typing import Any, Optional
-import replicate
+from crawler.llm import replicate
 from langchain_core.runnables import RunnableConfig
 from motor.motor_asyncio import AsyncIOMotorClient
 from crawler.config import Configuration
 from crawler.cost_tracker import tracker
 from crawler.models import GraphEntity, Triple
 from crawler.state import State
+from crawler.utils import clean_text as _clean_text
 
 _client: AsyncIOMotorClient | None = None
 
@@ -17,19 +21,9 @@ def _get_client():
     if _client is None:
         uri = os.getenv("MONGO_URI", "mongodb://localhost:27017")
         if not uri.startswith(("mongodb://", "mongodb+srv://")):
-            if uri.startswith(("bolt://", "neo4j://", "bolt+s://", "neo4j+s://")):
-                raise ValueError(
-                    f"[EntityExtractor] MONGO_URI looks like a Neo4j URI: {uri!r}\n"
-                    "Fix .env: MONGO_URI=mongodb://localhost:27017"
-                )
             raise ValueError(f"[EntityExtractor] MONGO_URI invalid: {uri!r}")
         _client = AsyncIOMotorClient(uri, serverSelectionTimeoutMS=5000)
     return _client
-
-def _clean_text(text: str) -> str:
-    text = re.sub(r"<[^>]+>", " ", text)
-    text = re.sub(r"&[a-zA-Z]+;", " ", text)
-    return re.sub(r"\s+", " ", text).strip()
 
 _PROMPT = """\
 You are a knowledge graph engineer building a ranking dataset. Extract ALL relevant entities and their comparative data.

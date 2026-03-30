@@ -15,7 +15,7 @@ import re
 import time
 from typing import Any, Optional
 
-import replicate
+from crawler.llm import replicate
 from langchain_core.runnables import RunnableConfig
 
 from crawler.config import Configuration

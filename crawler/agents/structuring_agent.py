@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-import replicate
+from crawler.llm import replicate
 
 from crawler.cost_tracker import tracker
 
@@ -152,7 +152,7 @@ No markdown, no explanation."""
 
 class StructuringAgent:
 
-    def __init__(self, *, chroma_persist_dir: str = "./chroma_db", chroma_entity_collection: str = "crawler_entities", chroma_embedding_dim: int = 384, model: str = "meta/meta-llama-3-70b-instruct", max_chroma_records: int = 500) -> None:
+    def __init__(self, *, chroma_persist_dir: str = "./chroma_db", chroma_entity_collection: str = "crawler_entities", chroma_embedding_dim: int = 384, model: str = "meta-llama/llama-3-70b-instruct", max_chroma_records: int = 500) -> None:
         ChromaKnowledgeBase = _get_chroma_class()
         self.kb = ChromaKnowledgeBase(persist_dir=chroma_persist_dir, collection_name=chroma_entity_collection, embedding_dimensions=chroma_embedding_dim)
         self.model = model

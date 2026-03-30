@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import Optional
 from urllib.parse import unquote, urlparse
 
-import replicate
+from crawler.llm import replicate
 
 from crawler.cost_tracker import tracker
 

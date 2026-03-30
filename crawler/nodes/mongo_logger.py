@@ -61,10 +61,15 @@ def _get_client() -> Any:
 
 
 async def _check_mongo_reachable() -> bool:
-    """Ping MongoDB. Returns False instead of raising."""
+    """Ping MongoDB. Returns False instead of raising.
+
+    Only caches a positive result. If MongoDB was previously down,
+    retries on the next call (matching neo4j_client behavior).
+    """
     global _mongo_ok
-    if _mongo_ok is not None:
-        return _mongo_ok
+    # Cache only positive state — retry if previously failed.
+    if _mongo_ok is True:
+        return True
     try:
         client = _get_client()
         await client.admin.command("ping")
@@ -72,7 +77,7 @@ async def _check_mongo_reachable() -> bool:
         print("[MongoLogger] ✅ MongoDB connection OK.")
         return True
     except Exception as exc:
-        _mongo_ok = False
+        _mongo_ok = None  # Don't cache False — allow retry
         uri = os.getenv("MONGO_URI", "mongodb://localhost:27017")
         err = _validate_mongo_uri(uri)
         if err:

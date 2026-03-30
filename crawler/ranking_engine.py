@@ -46,10 +46,11 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-import replicate
+from crawler.llm import replicate
 
 from crawler.cost_tracker import tracker
 from crawler.models import StructuredResult
+from crawler.utils import geo_filter_entities
 
 
 # ── Constants ─────────────────────────────────────────────────
@@ -182,7 +183,7 @@ def _extract_number(value: Any) -> float | None:
         "always": 5.0, "usually": 4.0, "often": 3.5,
         "sometimes": 2.5, "rarely": 1.5, "never": 1.0,
         # Size
-        "very large": 5.0, "large": 4.0, "medium": 3.0,
+        "very large": 5.0, "large": 4.0,
         "small": 2.0, "very small": 1.0,
         # Tier
         "tier 1": 5.0, "tier 2": 4.0, "tier 3": 3.0, "tier 4": 2.0,
@@ -267,6 +268,8 @@ def _build_feature_matrix(
             row[k] = str(v)
 
         for rel in entity.relationships:
+            if not isinstance(rel, dict):
+                continue
             rel_type = rel.get("type", "")
             target   = rel.get("target", "")
             if rel_type and target:
@@ -336,10 +339,19 @@ def _run_topsis(
     }
 
     # Step 4: ideal best (A+) and ideal worst (A-)
+    # Track which entities have actual data for each criterion so we can
+    # distinguish "real zero" from "missing data" in the ideal computation.
+    has_data: dict[str, list[bool]] = {
+        crit.column: [(raw[crit.column][i] is not None) for i in range(n)]
+        for crit in criteria
+    }
     ideal_best:  dict[str, float] = {}
     ideal_worst: dict[str, float] = {}
     for crit in criteria:
-        vals = [v for v in weighted[crit.column] if v != 0.0] or [0.0]
+        # Only consider entities with actual data for this criterion
+        vals = [weighted[crit.column][i] for i in range(n) if has_data[crit.column][i]]
+        if not vals:
+            vals = [0.0]
         if crit.higher_is_better:
             ideal_best[crit.column]  = max(vals)
             ideal_worst[crit.column] = min(vals)
@@ -551,11 +563,21 @@ def _select_criteria_llm(
         print(f"[RankingEngine] LLM JSON parse failed: {exc}. Using equal weights.")
         return _equal_weight_criteria(all_columns), "Equal weight fallback."
 
+    if not isinstance(parsed, dict):
+        print("[RankingEngine] LLM returned non-object JSON. Using equal weights.")
+        return _equal_weight_criteria(all_columns), "Equal weight fallback."
+
     rationale   = parsed.get("ranking_rationale", "")
     valid_cols  = set(all_columns)
     criteria: list[RankingCriterion] = []
 
-    for item in parsed.get("criteria", []):
+    raw_criteria = parsed.get("criteria", [])
+    if not isinstance(raw_criteria, list):
+        raw_criteria = []
+
+    for item in raw_criteria:
+        if not isinstance(item, dict):
+            continue
         col = str(item.get("column", "")).strip()
         if col not in valid_cols:
             continue
@@ -608,52 +630,15 @@ def _equal_weight_criteria(columns: list[str]) -> list[RankingCriterion]:
 
 
 # ── Geographic filter ─────────────────────────────────────────
+# Delegated to the shared utility in crawler.utils to avoid duplication
+# with ranking_agent.py.
 
 def _apply_geographic_filter(
     entities:   list[StructuredResult],
     user_query: str,
 ) -> list[StructuredResult]:
     """Remove entities whose location contradicts the query's geographic focus."""
-    q = user_query.lower()
-
-    geo_filters = {
-        "india":     ["united states", "usa", "u.s.", "silicon valley", "london", "uk", "singapore", "europe", "australia", "canada"],
-        "us":        ["india", "china", "europe", "australia"],
-        "uk":        ["india", "usa", "china", "australia"],
-        "europe":    ["india", "usa", "china", "australia"],
-    }
-
-    target_region = None
-    for region in geo_filters:
-        keywords = [region] if region != "india" else ["india", "indian", "bangalore", "bengaluru", "mumbai", "delhi", "hyderabad", "chennai", "pune"]
-        if any(kw in q for kw in keywords):
-            target_region = region
-            break
-
-    if not target_region:
-        return entities
-
-    exclude = set(geo_filters[target_region])
-    filtered, removed = [], []
-
-    for entity in entities:
-        location = str(
-            entity.properties.get("Located In")
-            or entity.properties.get("Headquartered In")
-            or entity.properties.get("Location", "")
-        ).lower()
-
-        contradicts = any(place in location for place in exclude) and target_region not in location and bool(location)
-
-        if contradicts:
-            removed.append(entity.name)
-        else:
-            filtered.append(entity)
-
-    if removed:
-        print(f"[RankingEngine] Geo-filtered {len(removed)} off-target entities: {removed[:5]}")
-
-    return filtered if filtered else entities
+    return geo_filter_entities(entities, user_query)
 
 
 # ── Public API ────────────────────────────────────────────────
@@ -670,7 +655,7 @@ class RankingEngine:
     LLM selects relevant columns and weights; all scoring is deterministic math.
     """
 
-    def __init__(self, *, model: str = "meta/meta-llama-3-70b-instruct") -> None:
+    def __init__(self, *, model: str = "meta-llama/llama-3-70b-instruct") -> None:
         self.model = model
 
     def rank(

@@ -220,7 +220,7 @@ class StructuringAgent_:
     def __init__(self, *, chroma_persist_dir: str = "./chroma_db",
                  chroma_entity_collection: str = "crawler_entities",
                  chroma_embedding_dim: int = 384,
-                 model: str = "meta/meta-llama-3-70b-instruct") -> None:
+                 model: str = "meta-llama/llama-3-70b-instruct") -> None:
         from crawler.agents.structuring_agent import StructuringAgent as _SA
         self._agent = _SA(
             chroma_persist_dir=chroma_persist_dir,
@@ -239,7 +239,7 @@ class StructuringAgent_:
 class RankingAgent_:
     """Scores a StructuredTable → RankedTable via LLM (ChromaDB path)."""
 
-    def __init__(self, *, model: str = "meta/meta-llama-3-70b-instruct") -> None:
+    def __init__(self, *, model: str = "meta-llama/llama-3-70b-instruct") -> None:
         from crawler.agents.ranking_agent import RankingAgent as _RA
         self._agent = _RA(model=model)
 
@@ -263,7 +263,7 @@ class Orchestrator:
     def __init__(
         self,
         *,
-        model: str = "meta/meta-llama-3-70b-instruct",
+        model: str = "meta-llama/llama-3-70b-instruct",
         chroma_persist_dir: str = "./chroma_db",
         chroma_raw_collection: str = "crawler_raw_sources",
         chroma_entity_collection: str = "crawler_entities",

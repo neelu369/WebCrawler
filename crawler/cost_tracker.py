@@ -1,29 +1,37 @@
-"""LLM cost tracker for Replicate API usage.
+"""LLM cost tracker for pipeline usage.
 
-Accumulates token counts and estimated USD costs per pipeline node so
-the user can see exactly where money is being spent.
+Uses contextvars to isolate costs per async task, so concurrent pipeline
+jobs don't mix their cost data.
 """
 
 from __future__ import annotations
 
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 
 
-# ── Replicate pricing (USD per token) ────────────────────────────────
-# Source: https://replicate.com/pricing  —  update if model changes.
+# ── Pricing (USD per token) ──────────────────────────────────────────
 MODEL_PRICING: dict[str, dict[str, float]] = {
-    "meta/meta-llama-3-8b-instruct": {
-        "input": 0.05 / 1_000_000,  # $0.05 per 1M input tokens
-        "output": 0.25 / 1_000_000,  # $0.25 per 1M output tokens
+    "meta-llama/llama-3-70b-instruct": {
+        "input": 0.65 / 1_000_000,
+        "output": 2.75 / 1_000_000,
     },
+    "meta-llama/llama-3-8b-instruct": {
+        "input": 0.05 / 1_000_000,
+        "output": 0.25 / 1_000_000,
+    },
+    # Legacy Replicate-format keys (kept for backward compatibility)
     "meta/meta-llama-3-70b-instruct": {
         "input": 0.65 / 1_000_000,
         "output": 2.75 / 1_000_000,
     },
+    "meta/meta-llama-3-8b-instruct": {
+        "input": 0.05 / 1_000_000,
+        "output": 0.25 / 1_000_000,
+    },
 }
 
-# Fallback for unknown models
 _DEFAULT_PRICING = {"input": 0.10 / 1_000_000, "output": 0.50 / 1_000_000}
 
 
@@ -46,7 +54,6 @@ class CostTracker:
     def __init__(self) -> None:
         self._calls: list[LLMCall] = []
 
-    # ── Recording ────────────────────────────────────────────
     def record(
         self,
         *,
@@ -70,7 +77,6 @@ class CostTracker:
         self._calls.append(entry)
         return entry
 
-    # ── Summaries ────────────────────────────────────────────
     def get_summary(self) -> dict:
         """Return a cost breakdown by node and a grand total."""
         by_node: dict[str, dict] = {}
@@ -124,5 +130,46 @@ class CostTracker:
         print("+---------------------------------------------------+\n")
 
 
-# Module-level singleton so all nodes share the same tracker per process.
-tracker = CostTracker()
+# ── Per-task isolation via contextvars ────────────────────────────────
+# asyncio.create_task() copies the current context, so each pipeline job
+# gets its own CostTracker instance when new_tracker() is called at the
+# start of the task.
+
+_tracker_var: ContextVar[CostTracker] = ContextVar("cost_tracker")
+
+
+def new_tracker() -> CostTracker:
+    """Create and set a fresh CostTracker for the current async context."""
+    t = CostTracker()
+    _tracker_var.set(t)
+    return t
+
+
+def get_tracker() -> CostTracker:
+    """Return the CostTracker for the current async context."""
+    try:
+        return _tracker_var.get()
+    except LookupError:
+        return new_tracker()
+
+
+class _TrackerProxy:
+    """Module-level proxy that delegates to the context-local CostTracker.
+
+    All existing ``from crawler.cost_tracker import tracker`` imports
+    continue to work unchanged — calls are forwarded to the task-local
+    tracker via the ContextVar.
+    """
+
+    def record(self, **kwargs):  # type: ignore[override]
+        return get_tracker().record(**kwargs)
+
+    def get_summary(self):
+        return get_tracker().get_summary()
+
+    def print_report(self):
+        return get_tracker().print_report()
+
+
+# Backward-compatible module-level singleton — now a thin proxy.
+tracker = _TrackerProxy()

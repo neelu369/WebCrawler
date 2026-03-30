@@ -11,7 +11,7 @@ import re
 import time
 from typing import Any, Optional
 
-import replicate
+from crawler.llm import replicate
 from langchain_core.runnables import RunnableConfig
 
 from crawler.config import Configuration
@@ -49,7 +49,9 @@ _RETRY_PROMPT = """\
 Previous search found these entities but is missing data for: {missing}
 
 Generate 6-8 NEW search queries specifically to find values for those missing metrics.
-Focus on official sources, statistics pages, and detailed profiles.
+Search across ALL available sources — blogs, news articles, startup directories,
+government databases, company profiles, interviews, and official pages.
+Do NOT limit to any particular source type.
 
 Target these entities: {entities}
 
@@ -64,13 +66,30 @@ async def parse_intent(
 
     configuration = Configuration.from_runnable_config(config)
 
+    if not state.user_query.strip():
+        print("[IntentParser] Empty user_query received; skipping query generation.")
+        return {"search_queries": [], "target_metrics": []}
+
     # Retry mode for missing metrics
     if state.retry_count > 0 and state.missing_data_targets:
+        pairs: list[tuple[str, str]] = []
+        for target in state.missing_data_targets[:8]:
+            if "::" in target:
+                entity, metric = target.split("::", 1)
+                entity = entity.strip()
+                metric = metric.strip()
+                if entity and metric:
+                    pairs.append((entity, metric))
 
-        entity_names = list({t.split(" ")[0] for t in state.missing_data_targets[:8]})
-        missing_metrics = list(
-            {" ".join(t.split(" ")[1:]) for t in state.missing_data_targets[:8]}
-        )
+        entity_names = list({entity for entity, _ in pairs})
+        missing_metrics = list({metric for _, metric in pairs})
+
+        if not entity_names or not missing_metrics:
+            # Backward-compatible fallback for old target formatting.
+            entity_names = list({t.split(" ")[0] for t in state.missing_data_targets[:8]})
+            missing_metrics = list(
+                {" ".join(t.split(" ")[1:]) for t in state.missing_data_targets[:8]}
+            )
 
         prompt = _RETRY_PROMPT.format(
             missing=", ".join(missing_metrics[:5]),
