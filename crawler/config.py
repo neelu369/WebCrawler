@@ -16,6 +16,16 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        return int(raw)
+    except Exception:
+        return default
+
+
 def _env_csv(name: str, default: list[str]) -> list[str]:
     raw = os.getenv(name)
     if not raw:
@@ -33,15 +43,42 @@ class Configuration:
     )
 
     max_search_results: int = field(
-        default=15,
+        default=75,
         metadata={"description": "Max results per SearXNG search query."},
     )
 
+    searxng_pages: int = field(
+        default=4,
+        metadata={"description": "How many SearXNG result pages to fetch per query."},
+    )
+
+    max_searxng_pages: int = field(
+        default=20,
+        metadata={"description": "Safety upper bound for SearXNG pages per query."},
+    )
+
     min_url_relevance_score: float = field(
-        default=0.2,
+        default=0.08,
         metadata={
             "description": "Minimum lexical overlap to keep a URL heuristics-only."
         },
+    )
+
+    url_filter_min_keep: int = field(
+        default=200,
+        metadata={
+            "description": "Minimum URLs to keep after relevance filtering (rescues borderline URLs for high recall)."
+        },
+    )
+
+    max_intent_queries: int = field(
+        default=80,
+        metadata={"description": "Maximum unique intent queries to keep on first pass."},
+    )
+
+    max_retry_queries: int = field(
+        default=80,
+        metadata={"description": "Maximum unique retry queries to keep during iterative enrichment."},
     )
 
     enable_serper_search: bool = field(
@@ -59,14 +96,14 @@ class Configuration:
     )
 
     min_word_count: int = field(
-        default=100,
+        default=40,
         metadata={
             "description": "Minimum word count to pass the crawler quality gate."
         },
     )
 
     crawler_concurrency: int = field(
-        default=5,
+        default=10,
         metadata={"description": "Maximum number of concurrent crawl workers."},
     )
 
@@ -104,19 +141,19 @@ class Configuration:
     )
 
     min_credibility: float = field(
-        default=0.25,
+        default=0.15,
         metadata={"description": "Minimum credibility score (0-1) to keep a source."},
     )
 
     min_relevance: float = field(
-        default=0.3,
+        default=0.15,
         metadata={
             "description": "Minimum relevance score (0-1) to keep a source. Filters off-topic pages."
         },
     )
 
     max_retries: int = field(
-        default=3,
+        default=5,
         metadata={
             "description": "How many times the pipeline may loop back to Intent Parser."
         },
@@ -146,6 +183,62 @@ class Configuration:
     enable_searxng_search: bool = field(
         default=True,
         metadata={"description": "Use self-hosted SearXNG instead of commercial APIs."},
+    )
+
+    enable_openclaw: bool = field(
+        default=False,
+        metadata={
+            "description": "If true, fetch crawl documents from an OpenClaw instance instead of direct URL crawling."
+        },
+    )
+
+    openclaw_base_url: str = field(
+        default_factory=lambda: os.getenv("OPENCLAW_BASE_URL", "http://localhost:3100"),
+        metadata={"description": "Base URL for the OpenClaw API endpoint."},
+    )
+
+    openclaw_search_path: str = field(
+        default_factory=lambda: os.getenv("OPENCLAW_SEARCH_PATH", "/api/v1/search"),
+        metadata={"description": "Relative API path used for OpenClaw search requests."},
+    )
+
+    openclaw_mode: str = field(
+        default_factory=lambda: os.getenv("OPENCLAW_MODE", "auto"),
+        metadata={
+            "description": "OpenClaw request mode: auto, search, or gateway (session-based)."
+        },
+    )
+
+    openclaw_session_key: str = field(
+        default_factory=lambda: os.getenv("OPENCLAW_SESSION_KEY", "agent:main"),
+        metadata={"description": "Session key used for gateway session endpoints."},
+    )
+
+    openclaw_api_key: str = field(
+        default_factory=lambda: os.getenv("OPENCLAW_API_KEY", ""),
+        metadata={"description": "Optional API key used for OpenClaw Authorization header."},
+    )
+
+    openclaw_max_docs_per_query: int = field(
+        default_factory=lambda: int(os.getenv("OPENCLAW_MAX_DOCS_PER_QUERY", "150")),
+        metadata={"description": "Maximum OpenClaw documents to retrieve per query."},
+    )
+
+    openclaw_timeout_s: int = field(
+        default_factory=lambda: _env_int("OPENCLAW_TIMEOUT_S", 45),
+        metadata={"description": "Timeout in seconds for OpenClaw API calls."},
+    )
+
+    openclaw_enable_cli_fallback: bool = field(
+        default_factory=lambda: _env_bool("OPENCLAW_ENABLE_CLI_FALLBACK", True),
+        metadata={
+            "description": "If true, fall back to OpenClaw CLI agent calls when REST endpoint is unavailable."
+        },
+    )
+
+    openclaw_cli_timeout_s: int = field(
+        default_factory=lambda: _env_int("OPENCLAW_CLI_TIMEOUT_S", 90),
+        metadata={"description": "Timeout in seconds for OpenClaw CLI fallback calls."},
     )
 
     mongo_db_name: str = field(

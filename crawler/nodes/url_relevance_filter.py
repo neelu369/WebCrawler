@@ -28,6 +28,7 @@ async def filter_relevant_urls(
 
     relevant: list[DiscoveredURL] = []
     irrelevant: list[DiscoveredURL] = []
+    dropped_ranked: list[tuple[float, float, DiscoveredURL]] = []
 
     for candidate in state.discovered_urls:
         decision = agent.assess(
@@ -42,6 +43,7 @@ async def filter_relevant_urls(
             verdict = "PASS"
         else:
             irrelevant.append(candidate)
+            dropped_ranked.append((decision.overlap_score, decision.confidence, candidate))
             verdict = "DROP"
 
         print(
@@ -50,9 +52,22 @@ async def filter_relevant_urls(
             f"overlap={decision.overlap_score:.2f} reason={decision.reason}"
         )
 
+    # High-recall rescue: keep top borderline dropped URLs so broad queries do not collapse.
+    target_keep = min(len(state.discovered_urls), max(0, int(configuration.url_filter_min_keep)))
+    rescued = 0
+    if len(relevant) < target_keep and dropped_ranked:
+        needed = target_keep - len(relevant)
+        dropped_ranked.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        rescue_candidates = [item[2] for item in dropped_ranked[:needed]]
+        rescued = len(rescue_candidates)
+        if rescued:
+            relevant.extend(rescue_candidates)
+            rescued_urls = {u.url for u in rescue_candidates}
+            irrelevant = [u for u in irrelevant if u.url not in rescued_urls]
+
     print(
         f"[URL Relevance] Kept {len(relevant)}/{len(state.discovered_urls)} URLs "
-        f"for crawling (dropped {len(irrelevant)})"
+        f"for crawling (dropped {len(irrelevant)}, rescued={rescued})"
     )
 
     return {"discovered_urls": relevant, "irrelevant_urls": irrelevant}

@@ -194,6 +194,8 @@ class RankRequest(BaseModel):
     min_relevance: float = Field(default=0.3, ge=0.0, le=1.0, description="Minimum relevance score to keep a source.")
     use_searxng_search: bool = Field(default=True, description="Enable local SearXNG metasearch.")
     use_playwright_mcp: bool = Field(default=True, description="Enable Playwright MCP fallback for dynamic pages.")
+    use_openclaw: bool = Field(default=False, description="Use OpenClaw instance as crawl backend.")
+    openclaw_max_docs_per_query: int = Field(default=150, ge=1, le=2000, description="Max docs per query from OpenClaw.")
     playwright_domain_allowlist: list[str] = Field(
         default_factory=list,
         description="Optional domain allowlist for Playwright MCP fallback.",
@@ -389,6 +391,8 @@ async def start_rank(request: RankRequest):
         "max_retries": request.max_retries,
         "min_credibility": request.min_credibility,
         "min_relevance": request.min_relevance,
+        "enable_openclaw": request.use_openclaw,
+        "openclaw_max_docs_per_query": request.openclaw_max_docs_per_query,
         "enable_searxng_search": request.use_searxng_search,
         "enable_playwright_mcp": request.use_playwright_mcp,
         "playwright_domain_allowlist": request.playwright_domain_allowlist,

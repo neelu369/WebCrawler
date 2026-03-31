@@ -33,7 +33,7 @@ You are a search-query generation expert for a web research pipeline.
 
 Given a user's ranking/research question, return a JSON object with:
 1. "target_metrics": list of 3-6 measurable criteria relevant to ranking these entities
-2. "search_queries": list of 6-10 search queries with varied angles
+2. "search_queries": list of 15-25 search queries with varied angles
 
 Each search query MUST be a JSON object with:
 - "query"       : specific search string — target INDIVIDUAL ENTITY pages
@@ -48,7 +48,7 @@ Return ONLY valid JSON, no markdown, no explanation.
 _RETRY_PROMPT = """\
 Previous search found these entities but is missing data for: {missing}
 
-Generate 6-8 NEW search queries specifically to find values for those missing metrics.
+Generate 12-16 NEW search queries specifically to find values for those missing metrics.
 Search across ALL available sources — blogs, news articles, startup directories,
 government databases, company profiles, interviews, and official pages.
 Do NOT limit to any particular source type.
@@ -58,6 +58,69 @@ Target these entities: {entities}
 Return ONLY a JSON array of query objects:
 [{{"query": "...", "topic": "...", "preferences": [], "priority": "high"}}]
 """
+
+
+def _augment_for_broad_collection(user_query: str, query_dicts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Expand query set for broad-coverage catalog questions (high recall mode)."""
+    ql = user_query.lower()
+    is_india_incubator_query = (
+        "india" in ql
+        and any(k in ql for k in ("incubator", "incubators", "accelerator", "accelerators", "startup"))
+    )
+    if not is_india_incubator_query:
+        return query_dicts
+
+    expansions = [
+        "list of startup incubators in india by city",
+        "state-wise startup incubators in india",
+        "government recognized incubators in india",
+        "india incubator directory site:startupindia.gov.in",
+        "startup incubators site:aim.gov.in india",
+        "technology business incubators india university",
+        "biotech incubators india list",
+        "fintech incubators india list",
+        "social impact incubators india list",
+        "women startup incubators india",
+        "startup accelerators in bengaluru",
+        "startup accelerators in mumbai",
+        "startup accelerators in delhi",
+        "startup accelerators in hyderabad",
+        "startup accelerators in chennai",
+        "startup accelerators in pune",
+        "startup accelerators in ahmedabad",
+        "incubation centres in iit iisc india",
+        "best startup incubators in india with portfolio",
+        "startup incubator cohort india application",
+    ]
+
+    for query in expansions:
+        query_dicts.append(
+            {
+                "query": query,
+                "topic": "India incubator discovery",
+                "preferences": ["directory", "official", "city-specific", "portfolio"],
+                "priority": "high",
+            }
+        )
+
+    return query_dicts
+
+
+def _dedupe_query_dicts(query_dicts: list[dict[str, Any]], limit: int = 40) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    out: list[dict[str, Any]] = []
+    for q in query_dicts:
+        text = str(q.get("query", "")).strip()
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(q)
+        if len(out) >= limit:
+            break
+    return out
 
 
 async def parse_intent(
@@ -123,7 +186,15 @@ async def parse_intent(
             if idx != -1:
                 cleaned = cleaned[idx:]
 
-            queries = [SearchQuery(**q) for q in json.loads(cleaned)]
+            raw_queries = json.loads(cleaned)
+            if not isinstance(raw_queries, list):
+                raw_queries = []
+            raw_queries = _augment_for_broad_collection(state.user_query, [q for q in raw_queries if isinstance(q, dict)])
+            raw_queries = _dedupe_query_dicts(
+                raw_queries,
+                limit=max(20, int(configuration.max_retry_queries)),
+            )
+            queries = [SearchQuery(**q) for q in raw_queries]
 
             print(f"[IntentParser] Retry: {len(queries)} targeted queries")
 
@@ -185,7 +256,12 @@ async def parse_intent(
             }
         ]
 
-    queries = [SearchQuery(**q) for q in query_dicts if isinstance(q, dict)]
+    query_dicts = _augment_for_broad_collection(state.user_query, [q for q in query_dicts if isinstance(q, dict)])
+    query_dicts = _dedupe_query_dicts(
+        query_dicts,
+        limit=max(20, int(configuration.max_intent_queries)),
+    )
+    queries = [SearchQuery(**q) for q in query_dicts]
 
     detected_top_n = _extract_top_n(state.user_query)
 

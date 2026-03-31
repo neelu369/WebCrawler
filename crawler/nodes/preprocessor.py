@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import time
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -95,6 +96,120 @@ Return ONLY the JSON array, no markdown brackets ```json, no explanation. If no 
 """
 
 
+_INCUBATOR_NAME_RE = re.compile(
+    r"\b([A-Z][A-Za-z0-9&()\-., ]{3,120}"
+    r"(?:Incubator|Incubation\s+(?:Center|Centre)|Accelerator|Innovation\s+Hub|Technology\s+Business\s+Incubator|TBI))\b"
+)
+
+
+def _strip_code_fences(text: str) -> str:
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.split("\n", 1)[1] if "\n" in cleaned else cleaned
+        cleaned = cleaned.rsplit("```", 1)[0]
+    return cleaned.strip()
+
+
+def _try_parse_entities_payload(raw_text: str) -> list[dict[str, Any]]:
+    """Parse model output defensively, tolerating extra prose around JSON."""
+    cleaned = _strip_code_fences(raw_text)
+
+    def _coerce(value: Any) -> list[dict[str, Any]]:
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+        if isinstance(value, dict):
+            if "name" in value:
+                return [value]
+            items = value.get("entities")
+            if isinstance(items, list):
+                return [item for item in items if isinstance(item, dict)]
+        return []
+
+    # 1) Direct parse
+    try:
+        return _coerce(json.loads(cleaned))
+    except Exception:
+        pass
+
+    # 2) Extract largest array blob
+    first_lb = cleaned.find("[")
+    last_rb = cleaned.rfind("]")
+    if first_lb != -1 and last_rb > first_lb:
+        maybe_array = cleaned[first_lb : last_rb + 1]
+        try:
+            return _coerce(json.loads(maybe_array))
+        except Exception:
+            pass
+
+    # 3) Extract object blob and coerce
+    first_lc = cleaned.find("{")
+    last_rc = cleaned.rfind("}")
+    if first_lc != -1 and last_rc > first_lc:
+        maybe_obj = cleaned[first_lc : last_rc + 1]
+        try:
+            return _coerce(json.loads(maybe_obj))
+        except Exception:
+            pass
+
+    return []
+
+
+def _coerce_metrics(raw_metrics: Any) -> dict[str, str]:
+    if isinstance(raw_metrics, dict):
+        return {str(k).strip(): str(v).strip() for k, v in raw_metrics.items() if str(k).strip()}
+    if isinstance(raw_metrics, list):
+        out: dict[str, str] = {}
+        for idx, item in enumerate(raw_metrics, 1):
+            key = f"Metric {idx}"
+            out[key] = str(item).strip()
+        return out
+    if raw_metrics in (None, ""):
+        return {}
+    return {"Metric": str(raw_metrics).strip()}
+
+
+def _safe_priority(value: Any) -> float:
+    try:
+        score = float(value)
+    except Exception:
+        return 0.5
+    return max(0.0, min(1.0, score))
+
+
+def _extract_incubator_entities_fallback(content: str, query: str) -> list[dict[str, Any]]:
+    """Heuristic fallback for incubator datasets when model JSON extraction fails."""
+    ql = query.lower()
+    incubator_mode = any(k in ql for k in ("incubator", "incubation", "accelerator", "startup"))
+    if not incubator_mode:
+        return []
+
+    found: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for match in _INCUBATOR_NAME_RE.finditer(content):
+        name = " ".join(match.group(1).split()).strip(" -,:;")
+        norm = name.lower()
+        if len(name) < 4 or norm in seen:
+            continue
+        seen.add(norm)
+
+        start = max(0, match.start() - 220)
+        end = min(len(content), match.end() + 220)
+        snippet = " ".join(content[start:end].split())
+
+        found.append(
+            {
+                "name": name,
+                "description": snippet[:260] if snippet else f"Mentioned in incubator source content: {name}",
+                "metrics": {},
+                "priority_score": 0.45,
+            }
+        )
+        if len(found) >= 25:
+            break
+
+    return found
+
+
 async def preprocess(
     state: State, config: Optional[RunnableConfig] = None
 ) -> dict[str, Any]:
@@ -135,18 +250,9 @@ async def preprocess(
                 latency_s=latency,
             )
 
-            # Parse expected JSON array
-            cleaned_resp = raw_text.strip()
-            if cleaned_resp.startswith("```"):
-                cleaned_resp = cleaned_resp.split("\n", 1)[1]
-                cleaned_resp = cleaned_resp.rsplit("```", 1)[0]
-
-            entities_data = json.loads(cleaned_resp)
-            if not isinstance(entities_data, list):
-                if isinstance(entities_data, dict) and "name" in entities_data:
-                    entities_data = [entities_data]
-                else:
-                    entities_data = []
+            entities_data = _try_parse_entities_payload(raw_text)
+            if not entities_data:
+                entities_data = _extract_incubator_entities_fallback(clean_content, state.user_query)
 
             for data in entities_data:
                 name = data.get("name", "Unknown Entity")
@@ -155,8 +261,8 @@ async def preprocess(
                     continue
 
                 desc = data.get("description", "")
-                metrics = data.get("metrics", {})
-                priority = float(data.get("priority_score", 0.5))
+                metrics = _coerce_metrics(data.get("metrics", {}))
+                priority = _safe_priority(data.get("priority_score", 0.5))
 
                 if norm_name in entity_aggregator:
                     existing = entity_aggregator[norm_name]

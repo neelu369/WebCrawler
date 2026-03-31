@@ -32,6 +32,17 @@ _active_session_id = ""
 _active_db_name = ""
 
 
+def _make_skip_finding(reason: str) -> dict[str, Any]:
+    """Emit a structured skip record so API/UI can surface investigator behavior."""
+    import time
+
+    return {
+        "status": "skipped",
+        "reason": reason,
+        "timestamp": time.time(),
+    }
+
+
 @tool
 async def search_web(query: str) -> str:
     """Search the web for specific information.
@@ -121,10 +132,15 @@ async def save_finding(entity_name: str, metric_name: str, value: str, source_ur
     if not _SAFE_REL_RE.match(predicate) or len(predicate) > 40:
         predicate = "HAS_PROPERTY"
 
-    merge_attr = "MERGE (a:Attribute {norm_name: $attr_norm}) ON CREATE SET a.name = $attr_name"
+    merge_attr = (
+        "MERGE (a:Attribute {normalized_name: $attr_norm}) "
+        "ON CREATE SET a.name = $attr_name"
+    )
     rel_query = f"""
-        MATCH (e:Entity {{norm_name: $norm_name}})
-        MATCH (a:Attribute {{norm_name: $attr_norm}})
+        MATCH (e:Entity)
+        WHERE coalesce(e.normalized_name, e.norm_name) = $norm_name
+        MATCH (a:Attribute)
+        WHERE coalesce(a.normalized_name, a.norm_name) = $attr_norm
         MERGE (e)-[r:{predicate}]->(a)
         ON CREATE SET r.original_pred = $original_pred,
                       r.source = $source_url,
@@ -183,11 +199,18 @@ async def run_react_investigator(state: State, config: Optional[RunnableConfig] 
     
     if not configuration.enable_react_investigator:
         print("[ReActInvestigator] Agent disabled in config. Skipping.")
-        return {"retry_count": state.retry_count + 1}
+        return {
+            "retry_count": state.retry_count + 1,
+            "investigator_findings": [_make_skip_finding("disabled_in_config")],
+        }
         
     gaps = state.missing_data_targets
     if not gaps:
-        return {"retry_count": state.retry_count + 1}
+        print("[ReActInvestigator] No missing_data_targets. Skipping.")
+        return {
+            "retry_count": state.retry_count + 1,
+            "investigator_findings": [_make_skip_finding("no_missing_targets")],
+        }
 
     # Set globals for the tools
     global _active_session_id, _active_db_name
@@ -204,7 +227,10 @@ async def run_react_investigator(state: State, config: Optional[RunnableConfig] 
     api_key = os.getenv("REPLICATE_API_TOKEN")
     if not api_key:
         print("[ReActInvestigator] Error: REPLICATE_API_TOKEN not found.")
-        return {"retry_count": state.retry_count + 1}
+        return {
+            "retry_count": state.retry_count + 1,
+            "investigator_findings": [_make_skip_finding("missing_replicate_api_token")],
+        }
 
     # Initialize the LLM (using LangChain's OpenAI wrapper pointing to Replicate's compatibility endpoint)
     llm = ChatOpenAI(
@@ -246,7 +272,12 @@ async def run_react_investigator(state: State, config: Optional[RunnableConfig] 
             # We don't strictly need to pass the raw data in state since save_finding writes to DB,
             # but tracking it is good for the UI.
             findings = [
-                {"agent_summary": final_msg, "timestamp": time.time()}
+                {
+                    "status": "completed",
+                    "reason": "ran",
+                    "agent_summary": final_msg,
+                    "timestamp": time.time(),
+                }
             ]
             
             return {
@@ -256,5 +287,19 @@ async def run_react_investigator(state: State, config: Optional[RunnableConfig] 
             
     except Exception as exc:
         print(f"[ReActInvestigator] Agent execution failed: {exc}")
-        
-    return {"retry_count": state.retry_count + 1}
+        return {
+            "retry_count": state.retry_count + 1,
+            "investigator_findings": [
+                {
+                    "status": "failed",
+                    "reason": "agent_execution_failed",
+                    "error": str(exc),
+                    "timestamp": time.time(),
+                }
+            ],
+        }
+
+    return {
+        "retry_count": state.retry_count + 1,
+        "investigator_findings": [_make_skip_finding("no_agent_messages")],
+    }

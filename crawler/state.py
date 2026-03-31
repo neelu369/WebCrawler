@@ -36,6 +36,7 @@ class State(InputState):
 
     # Web Crawler
     crawled_docs: list[CrawledDoc] = field(default_factory=list)
+    preloaded_crawled_docs: list[CrawledDoc] = field(default_factory=list)
 
     # Source Verifier
     verified_sources: list[VerifiedSource] = field(default_factory=list)

@@ -204,6 +204,8 @@ async def _crawl_single(
     url: str,
     configuration: Configuration,
     mcp_pool: _PlaywrightMCPPool,
+    shared_crawler: AsyncWebCrawler | None,
+    crawl4ai_sem: asyncio.Semaphore,
 ) -> CrawledDoc | None:
     """Try crawl4ai, then Playwright MCP, then httpx, then ScraperAPI for anti-bot pages."""
     min_words = configuration.min_word_count
@@ -211,9 +213,11 @@ async def _crawl_single(
     js_heavy_suspected = False
 
     # ── Attempt 1: crawl4ai (primary) ───────────────────────
-    try:
-        async with AsyncWebCrawler() as crawler:
-            result = await crawler.arun(url=url)
+    if shared_crawler is not None:
+        try:
+            # Bound crawl4ai calls independently from overall task concurrency.
+            async with crawl4ai_sem:
+                result = await shared_crawler.arun(url=url)
             text = result.markdown or result.extracted_content or ""
             js_heavy_suspected = _looks_js_heavy(text)
             anti_bot_suspected = anti_bot_suspected or _looks_antibot_text(text)
@@ -229,12 +233,12 @@ async def _crawl_single(
                 f"[Web Crawler] crawl4ai thin content for {url} "
                 f"(words={word_count} < min_words={min_words})"
             )
-    except Exception as exc:
-        safe_exc = str(exc).encode("ascii", errors="replace").decode("ascii")
-        low_exc = safe_exc.lower()
-        if "403" in low_exc or "429" in low_exc or "captcha" in low_exc or "cloudflare" in low_exc:
-            anti_bot_suspected = True
-        print(f"[Web Crawler] crawl4ai failed for {url}: {safe_exc}")
+        except Exception as exc:
+            safe_exc = str(exc).encode("ascii", errors="replace").decode("ascii")
+            low_exc = safe_exc.lower()
+            if "403" in low_exc or "429" in low_exc or "captcha" in low_exc or "cloudflare" in low_exc:
+                anti_bot_suspected = True
+            print(f"[Web Crawler] crawl4ai failed for {url}: {safe_exc}")
 
     # ── Attempt 2: Playwright MCP fallback for JS/thin pages ─
     should_try_playwright = configuration.enable_playwright_mcp and _domain_allowed(
@@ -335,6 +339,17 @@ async def crawl_pages(
 ) -> dict[str, Any]:
     """Crawl all discovered URLs in parallel with a quality gate."""
     configuration = Configuration.from_runnable_config(config)
+    min_words = max(1, int(configuration.min_word_count))
+
+    preloaded_docs = [d for d in (state.preloaded_crawled_docs or []) if d.word_count >= min_words]
+    preloaded_urls = {d.url for d in preloaded_docs}
+    remaining_urls = [u for u in state.discovered_urls if u.url not in preloaded_urls]
+
+    if preloaded_docs:
+        print(
+            f"[Web Crawler] Using {len(preloaded_docs)} preloaded docs "
+            f"(method=openclaw, min_words={min_words})."
+        )
 
     # Open a single shared Playwright MCP session for the entire batch
     mcp_pool = _PlaywrightMCPPool(configuration)
@@ -342,17 +357,39 @@ async def crawl_pages(
     async with mcp_pool.open():
         # Launch all crawls concurrently (with a semaphore to be polite)
         sem = asyncio.Semaphore(max(1, configuration.crawler_concurrency))
+        crawl4ai_sem = asyncio.Semaphore(min(4, max(1, configuration.crawler_concurrency // 2)))
 
-        async def _bounded(url: str) -> CrawledDoc | None:
-            async with sem:
-                return await _crawl_single(url, configuration, mcp_pool)
+        shared_crawler: AsyncWebCrawler | None = None
+        try:
+            shared_crawler_ctx = AsyncWebCrawler()
+            shared_crawler = await shared_crawler_ctx.__aenter__()
+        except Exception as exc:
+            safe_exc = str(exc).encode("ascii", errors="replace").decode("ascii")
+            print(f"[Web Crawler] Failed to initialize shared crawl4ai session: {safe_exc}")
+            shared_crawler = None
 
-        tasks = [_bounded(u.url) for u in state.discovered_urls]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            async def _bounded(url: str) -> CrawledDoc | None:
+                async with sem:
+                    return await _crawl_single(
+                        url,
+                        configuration,
+                        mcp_pool,
+                        shared_crawler,
+                        crawl4ai_sem,
+                    )
+
+            tasks = [_bounded(u.url) for u in remaining_urls]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            if shared_crawler is not None:
+                await shared_crawler_ctx.__aexit__(None, None, None)
 
     # Collect successful results and log method distribution
-    docs: list[CrawledDoc] = []
+    docs: list[CrawledDoc] = list(preloaded_docs)
     method_counts: dict[str, int] = {}
+    if preloaded_docs:
+        method_counts["openclaw"] = len(preloaded_docs)
     for r in results:
         if isinstance(r, CrawledDoc):
             docs.append(r)
@@ -361,7 +398,7 @@ async def crawl_pages(
     methods_str = ", ".join(f"{m}={c}" for m, c in sorted(method_counts.items()))
     print(
         f"[Web Crawler] Crawled {len(docs)} pages "
-        f"(of {len(state.discovered_urls)} attempted, "
+        f"(of {len(state.discovered_urls)} discovered, {len(remaining_urls)} attempted crawl, "
         f"min_words={configuration.min_word_count}, "
         f"playwright_mcp={configuration.enable_playwright_mcp}, "
         f"methods=[{methods_str}])"
